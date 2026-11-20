@@ -1,6 +1,6 @@
 {
   "productName": "Yousoro Workspace",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "ru.yousoro.workspace",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -40,7 +40,12 @@
       "icons/icon.ico",
       "icons/icon.icns"
     ],
-    "createUpdaterArtifacts": true
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "nsis": {
+        "installerHooks": "windows-hooks.nsh"
+      }
+    }
   },
   "plugins": {
     "updater": {

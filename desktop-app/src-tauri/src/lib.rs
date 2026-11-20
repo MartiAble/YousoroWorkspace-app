@@ -8,11 +8,11 @@ mod tunnel;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::{process::Command, sync::Mutex};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tunnel::Tunnel;
 
 #[derive(Default)]
-struct Runtime(Mutex<Option<Connection>>, Mutex<()>, radar::BrowserProbe);
+struct Runtime(Mutex<Option<Connection>>, Mutex<()>, radar::BrowserProbe, std::sync::atomic::AtomicBool);
 
 struct Connection {
     proxy: Option<system_proxy::Lease>,
@@ -143,7 +143,8 @@ async fn run_system_radar(app: AppHandle, lookup_geo: bool, check_dns: Option<bo
         let state = app.state::<Runtime>();
         let device_id = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?.as_ref()
             .filter(|active| active.tunnel.port == port).and_then(|active| active.device_id.clone());
-        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref());
+        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref(),
+            |stage| { let _ = app.emit("radar-progress", stage); });
         if status(&app).port != Some(port) { return Err("Туннель изменился во время диагностики".into()); }
         Ok(report)
     }).await
@@ -219,6 +220,52 @@ async fn clear_browser_profile(app: AppHandle, region: String) -> Result<(), Str
 }
 
 #[tauri::command]
+async fn repair_browser_profile(app: AppHandle, region: String) -> Result<(), String> {
+    blocking(move || {
+        let state = app.state::<Runtime>();
+        let _guard = state.1.lock().map_err(|_| "Ошибка состояния профиля")?;
+        let data = app.path().app_data_dir().map_err(|_| "Не удалось открыть каталог приложения")?;
+        launch::repair_preferences(&launch::profile_path(&data, &region)?)
+    }).await
+}
+
+#[tauri::command]
+fn open_time_settings() -> Result<(), String> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("/usr/bin/open");
+        command.arg("x-apple.systempreferences:com.apple.Date-Time-Settings.extension");
+        command
+    } else {
+        let mut command = Command::new("explorer.exe");
+        command.arg("ms-settings:dateandtime");
+        command
+    };
+    command.spawn().map(|_| ()).map_err(|_| "Не удалось открыть настройки времени".into())
+}
+
+#[tauri::command]
+fn take_radar_link(app: AppHandle) -> bool {
+    app.state::<Runtime>().3.swap(false, std::sync::atomic::Ordering::AcqRel)
+}
+
+fn radar_link(url: &str) -> bool {
+    matches!(url, "yousoro://radar" | "yousoro://radar/")
+}
+
+fn show_radar(app: &AppHandle) {
+    app.state::<Runtime>().3.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        let _ = window.emit("open-radar", ());
+    }
+}
+
+#[cfg(windows)]
+struct WindowsInstance { _lock: std::fs::File }
+
+#[tauri::command]
 async fn installed_desktop_apps(app: AppHandle) -> Result<apps::InstalledApps, String> {
     blocking(move || {
         let route = status(&app);
@@ -239,7 +286,8 @@ async fn launch_desktop_app(app: AppHandle, client: apps::DesktopApp, restart: b
 }
 #[tauri::command]
 fn open_official(page: String) -> Result<(),String> {
-    let url=match page.as_str() { "claude"=>"https://claude.com/download","chatgpt"=>"https://chatgpt.com/download/","workspace"=>service::ORIGIN,_=>return Err("Неизвестная страница".into()) };
+    let phone = format!("{}/setup/rules", service::ORIGIN);
+    let url=match page.as_str() { "phone"=>phone.as_str(), "claude"=>"https://claude.com/download","chatgpt"=>"https://chatgpt.com/download/","workspace"=>service::ORIGIN,_=>return Err("Неизвестная страница".into()) };
     let mut cmd=if cfg!(target_os="macos") { Command::new("/usr/bin/open") } else { let mut c=Command::new("rundll32.exe"); c.arg("url.dll,FileProtocolHandler"); c };
     cmd.arg(url).spawn().map_err(|_| "Не удалось открыть страницу".into()).map(|_| ())
 }
@@ -249,6 +297,23 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Runtime::default()).setup(|app| {
+        #[cfg(windows)]
+        {
+            let data = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data)?;
+            let lock = std::fs::OpenOptions::new().create(true).truncate(false)
+                .read(true).write(true).open(data.join("workspace.lock"))?;
+            let requested = std::env::args().skip(1).any(|arg| radar_link(&arg));
+            match lock.try_lock() {
+                Ok(()) => { app.manage(WindowsInstance { _lock: lock }); }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if requested { std::fs::write(data.join("radar-request"), [])?; }
+                    std::process::exit(0);
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+            if requested { show_radar(app.handle()); }
+        }
         use tauri::{menu::{Menu,MenuItem},tray::TrayIconBuilder};
         let show=MenuItem::with_id(app,"show","Открыть Workspace",true,None::<&str>)?;
         let browser=MenuItem::with_id(app,"browser","Открыть рабочий браузер",true,None::<&str>)?;
@@ -264,13 +329,20 @@ pub fn run() {
         if cfg!(windows) {
             if let Ok(data) = app.path().app_data_dir() { let _ = system_proxy::Lease::recover(&data); }
             let handle = app.handle().clone();
+            let radar_request = app.path().app_data_dir()?.join("radar-request");
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(3));
+                if std::fs::remove_file(&radar_request).is_ok() { show_radar(&handle); }
                 let _ = status(&handle);
             });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official])
+    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link])
       .build(tauri::generate_context!()).expect("Workspace setup failed")
-      .run(|app,event| { if matches!(event,tauri::RunEvent::Exit) { let _=disconnect(app.clone()); } });
+      .run(|app,event| match event {
+          tauri::RunEvent::Exit => { let _ = disconnect(app.clone()); }
+          #[cfg(target_os = "macos")]
+          tauri::RunEvent::Opened { urls } if urls.iter().any(|url| radar_link(url.as_str())) => show_radar(app),
+          _ => {}
+      });
 }

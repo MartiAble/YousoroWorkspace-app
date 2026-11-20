@@ -1,28 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, isTauri } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { Radar, desktopLabel, usableObservation, type DesktopClient, type InstalledApps, type Observation, type RadarReport } from './radar';
 import { UpdateSettings, useAppUpdates } from './updates';
 import './style.css';
 
 type Profile = { applied?: string; requested?: string; state: string };
 type Account = { email: string; access: string; profile: Profile; bound: { limit:number; items:{id:string;name:string;os:string}[] } };
-type Connection = { port: number | null; region: string | null; system_proxy?:boolean; system_proxy_supported?:boolean; proxy_error?:string|null };
-type Region = {id:string; name:string};
-type DesktopClient = 'claude' | 'chatgpt';
-type DesktopStatus = {installed:boolean; running:boolean; store:boolean; proxy:'arguments'|'system'|'unknown'};
-type InstalledApps = Record<DesktopClient, DesktopStatus|null>;
-type Observation = {ip:string; latency_ms:number};
-type RadarReport = {
-  network:Observation|null; network_error:string|null; matched:boolean|null;
-  geo:{country:string|null; city:string|null; connection:{isp:string|null; asn:number|null}|null}|null;
-  browser:{running:boolean|null; expected_timezone:string; expected_language:string;
-    actual:{timezone:string;language:string}|null; launch_language:string|null;
-    geolocation_blocked:boolean|null; webrtc_protected:boolean|null};
-  dns:{status:'distinct'|'overlap'|'unavailable'; tunnel_resolvers:number; system_resolvers:number}|null;
-  devices:{used:number;limit:number;desktop:number;mobile:number;current_pc:boolean|null}|null;
-  timezone:string|null; system_proxy:boolean|null; apps:InstalledApps;
-  ready:number; total:number; hints:string[];
-};
+type Connection = { port:number|null; region:string|null; system_proxy?:boolean; system_proxy_supported?:boolean; proxy_error?:string|null };
+type Region = { id:string; name:string };
 const tabs = ['Рабочее место','Радар подключения','CLI и Терминал','Устройства и настройки'];
 const empty = {port:null,region:null};
 const native = isTauri();
@@ -33,8 +20,8 @@ function App() {
   const [connection,setConnection] = useState<Connection>(empty);
   const [observed,setObserved] = useState<RadarReport|null>(null);
   const [outbound,setOutbound] = useState<Observation|null>(null);
-  const [lookupGeo,setLookupGeo] = useState(false);
-  const [checkDns,setCheckDns] = useState(false);
+  const networkRevision = useRef(0);
+  const [radarStage,setRadarStage] = useState<'network'|'profile'|'devices'|null>(null);
   const [tab,setTab] = useState(0);
   const [error,setError] = useState('');
   const [working,setBusy] = useState(false);
@@ -45,6 +32,14 @@ function App() {
   const [installed,setInstalled] = useState<InstalledApps|null>(null);
   const [resetRegion,setResetRegion] = useState<string|null>(null);
   const profileRegion = connection.region || account?.profile.applied;
+  useEffect(() => {
+    if (!native) return;
+    const openRadar = () => { void invoke<boolean>('take_radar_link').then(requested => { if (requested) setTab(1); }).catch(() => {}); };
+    const radarLink = listen('open-radar', openRadar);
+    void radarLink.then(openRadar).catch(() => {});
+    const progress = listen<'network'|'profile'|'devices'>('radar-progress', event => setRadarStage(event.payload));
+    return () => { void radarLink.then(unlisten => unlisten()).catch(() => {}); void progress.then(unlisten => unlisten()).catch(() => {}); };
+  }, []);
   useEffect(() => { setResetRegion(null); }, [profileRegion, tab]);
   useEffect(() => {
     if (!native || tab !== 0) return;
@@ -80,9 +75,12 @@ function App() {
     setObserved(null);
     if (!native || !connection.port) return;
     let active = true;
-    const refresh = () => invoke<Observation>('observe_tunnel')
-      .then(result => { if (active) setOutbound(result); })
-      .catch(() => { if (active) setOutbound(null); });
+    const refresh = () => {
+      const revision = networkRevision.current;
+      return invoke<Observation>('observe_tunnel')
+        .then(result => { if (active && revision === networkRevision.current) setOutbound(usableObservation(result)); })
+        .catch(() => { if (active && revision === networkRevision.current) setOutbound(null); });
+    };
     void refresh();
     const id = window.setInterval(refresh, 45000);
     return () => { active = false; window.clearInterval(id); };
@@ -102,10 +100,34 @@ function App() {
     try { await navigator.clipboard.writeText(text); setMessage('Скопировано'); }
     catch { setError('Буфер обмена недоступен. Выделите текст вручную.'); }
   }
-  const scan = () => perform(async () => {
-    const result = await invoke<RadarReport>('run_system_radar',{lookupGeo,checkDns});
-    setObserved(result);
-    setOutbound(result.network);
+  async function readRadar() {
+    networkRevision.current += 1;
+    setRadarStage('network');
+    try {
+      const result = await invoke<RadarReport>('run_system_radar',{lookupGeo:true,checkDns:true});
+      networkRevision.current += 1;
+      setObserved(result);
+      setOutbound(usableObservation(result.network));
+    } finally { setRadarStage(null); }
+  }
+  const scan = () => perform(readRadar);
+  const connectRadar = () => perform(async () => {
+    if (connection.port) setConnection(await invoke<Connection>('disconnect'));
+    setConnection(await invoke<Connection>('connect_tunnel'));
+  });
+  const repairRadar = () => perform(async () => {
+    if (!profileRegion) return;
+    await invoke('repair_browser_profile',{region:profileRegion});
+    await readRadar();
+    setMessage('Настройки рабочего профиля обновлены');
+  });
+  const routeRadarClient = (client:DesktopClient) => perform(async () => {
+    await invoke('launch_desktop_app',{client,restart:true});
+    await readRadar();
+  });
+  const enableRadarProxy = () => perform(async () => {
+    setConnection(await invoke<Connection>('set_system_proxy',{enabled:true}));
+    await readRadar();
   });
   const proxy = connection.port ? 'http://127.0.0.1:'+connection.port : '';
   const terminal = proxy ? ['export HTTPS_PROXY='+proxy+' HTTP_PROXY='+proxy, "$env:HTTPS_PROXY='"+proxy+"'; $env:HTTP_PROXY='"+proxy+"'"] : [];
@@ -181,14 +203,14 @@ function App() {
             })}
             <Card title="CLI и Терминал" description="Подключение рабочих команд к локальному прокси."><button onClick={()=>setTab(2)}>Команды прокси</button></Card>
           </div></>}
-        {tab===1 && <section className="panel diagnostics"><p>Проверяем внешний IPv4 через туннель и параметры рабочего профиля.</p>
-          <label className="geo-option"><input type="checkbox" checked={lookupGeo} onChange={e=>setLookupGeo(e.target.checked)}/> Запросить страну, город и ASN у ipwho.is</label>
-          {lookupGeo && <p>Запрос к ipwho.is идёт напрямую и передаёт внешний IPv4 туннеля.</p>}
-          <label className="geo-option"><input type="checkbox" checked={checkDns} onChange={e=>setCheckDns(e.target.checked)}/> Сравнить DNS-резолверы через bash.ws</label>
-          {checkDns && <p>Сравниваем тестовые DNS-имена системного маршрута и SOCKS5. Сервис увидит сетевые адреса этих запросов.</p>}
-          <button className="primary" onClick={()=>void scan()} disabled={busy || !connection.port}>Запустить диагностику</button>
-          {observed && <RadarSummary report={observed}/>}
-        </section>}
+        {tab===1 && <Radar
+          report={observed} network={outbound} connected={!!connection.port} busy={busy} stage={radarStage}
+          region={regions.find(region=>region.id===profileRegion)?.name || ''} windows={!!connection.system_proxy_supported}
+          scan={()=>void scan()} connect={()=>void connectRadar()} repair={()=>void repairRadar()}
+          time={()=>void perform(()=>invoke('open_time_settings'))} phone={()=>void official('phone')}
+          browser={()=>void open('workspace')} proxy={()=>void enableRadarProxy()}
+          client={client=>void routeRadarClient(client)} copy={text=>void copy(text)}
+        />}
         {tab===2 && <section className="panel diagnostics">{terminal.length ? terminal.map((command,index)=><div className="command" key={command}><span>{index ? 'PowerShell':'macOS / Bash'}</span><code>{command}</code><button onClick={()=>void copy(command)}>Скопировать</button></div>) : <p>Сначала подключите туннель, чтобы получить команды.</p>}<div className="actions"><button disabled={!connection.port || busy} onClick={()=>void perform(()=>invoke('launch_terminal'))}>Открыть терминал</button><button disabled={!connection.port || busy} onClick={()=>{setTab(1);void scan();}}>Проверить HTTPS через прокси</button></div></section>}
         {tab===3 && <><UpdateSettings updates={updates} busy={busy}/><section className="panel diagnostics"><h2>Привязанные устройства</h2><p>Использовано {account.bound.items.length} из {account.bound.limit}. Новый нативный клиент использует отдельную привязку.</p><ul>{account.bound.items.map(item=><li key={item.id}>{item.name} · {item.os}</li>)}</ul><button disabled={busy} onClick={()=>void official('workspace')}>Открыть веб-кабинет</button></section></>}
       </main>
@@ -196,63 +218,6 @@ function App() {
     </div>
   </div>;
 }
-function desktopLabel(status:DesktopStatus) {
-  if (!status.installed) return 'Не установлен';
-  if (!status.running) return 'Установлен';
-  if (status.proxy==='arguments') return 'Запущен · с параметрами туннеля';
-  if (status.proxy==='system') return 'Запущен · системный прокси направлен на туннель';
-  return 'Запущен · маршрут не подтверждён';
-}
-
-function RadarSummary({report}:{report:RadarReport}) {
-  const {network,geo,browser,apps} = report;
-  const unavailable = 'Нет данных';
-  const check = (value:boolean|null, yes:string, no:string) => value===null?unavailable:value?yes:no;
-  return <>
-    <p><strong>Готовность контура {report.total ? Math.round(100*report.ready/report.total) : 0}%</strong> · {report.ready} из {report.total} проверок</p>
-    <div className="radar-grid">
-      <section>
-        <h2>Сеть и выходной шлюз</h2>
-        <dl>
-          <dt>Внешний IPv4</dt><dd>{network?.ip ?? report.network_error ?? unavailable}</dd>
-          <dt>Задержка HTTPS</dt><dd>{network ? network.latency_ms+' мс' : unavailable}</dd>
-          <dt>Страна / город</dt><dd>{[geo?.country,geo?.city].filter(Boolean).join(', ') || unavailable}</dd>
-          <dt>Провайдер / ASN</dt><dd>{[geo?.connection?.isp,geo?.connection?.asn && 'AS'+geo.connection.asn].filter(Boolean).join(' · ') || unavailable}</dd>
-          <dt>Сверка с узлом</dt><dd>{check(report.matched,'Подтверждена','IP отличается')}</dd>
-          <dt>Сравнение DNS</dt><dd>{report.dns?.status==='distinct' ? 'В пробе резолверы различаются' : report.dns?.status==='overlap' ? 'Есть общие резолверы' : report.dns ? 'Проверка недоступна' : 'Проверка не запускалась'}
-            {report.dns && <><br/>Через SOCKS5: {report.dns.tunnel_resolvers}, системных: {report.dns.system_resolvers}</>}
-          </dd>
-
-        </dl>
-      </section>
-      <section>
-        <h2>Изолированный браузер</h2>
-        <dl>
-          <dt>Рабочий профиль</dt><dd>{check(browser.running,'Открыт','Закрыт')}</dd>
-          <dt>Часовой пояс</dt><dd>Ожидаемый {browser.expected_timezone}<br/>Фактический {browser.actual?.timezone ?? unavailable}</dd>
-          <dt>Язык</dt><dd>Ожидаемый {browser.expected_language}<br/>Флаг запуска {browser.launch_language ?? unavailable}<br/>В браузере {browser.actual?.language ?? unavailable}</dd>
-          <dt>Геолокация</dt><dd>{check(browser.geolocation_blocked,'Блокируется в профиле','Блокировка отключена')}</dd>
-          <dt>WebRTC</dt><dd>{check(browser.webrtc_protected,'Ограничение включено','Ограничение отключено')}</dd>
-        </dl>
-      </section>
-      <section>
-        <h2>Система и приложения</h2>
-        <dl>
-          <dt>Часовой пояс ОС</dt><dd>{report.timezone ?? unavailable}</dd>
-          <dt>Системный прокси</dt><dd>{check(report.system_proxy,'Указывает на туннель','Туннель не задан')}</dd>
-          <dt>Claude Desktop</dt><dd>{apps.claude ? desktopLabel(apps.claude) : unavailable}</dd>
-          <dt>ChatGPT Desktop</dt><dd>{apps.chatgpt ? desktopLabel(apps.chatgpt) : unavailable}</dd>
-          <dt>Активные слоты аккаунта</dt><dd>{report.devices ? report.devices.used+' из '+report.devices.limit : unavailable}</dd>
-          <dt>ПК / телефоны</dt><dd>{report.devices ? report.devices.desktop+' / '+report.devices.mobile : unavailable}</dd>
-          <dt>Текущий ПК</dt><dd>{check(report.devices?.current_pc ?? null,'Привязка активна','Привязка отсутствует в списке')}</dd>
-
-        </dl>
-      </section>
-    </div>
-    {!!report.hints.length && <ul>{report.hints.map(hint=><li key={hint}>{hint}</li>)}</ul>}
-  </>;
-}
-
 function Brand(){return <div className="brand"><img src="/favicon.svg" width="25" height="25" alt=""/><strong>Yousoro</strong> Workspace</div>;}
 function Card({title,description,children}:{title:string;description:string;children:React.ReactNode}){return <article className="panel"><h2>{title}</h2><p>{description}</p><div className="actions">{children}</div></article>;}
 createRoot(document.getElementById('root')!).render(<App/>);

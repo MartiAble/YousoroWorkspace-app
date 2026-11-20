@@ -61,6 +61,47 @@ fn prepare_preferences(profile: &Path) -> io::Result<()> {
     }
 }
 
+pub fn repair_preferences(profile: &Path) -> Result<(), String> {
+    if browser_process(profile)?.is_some() {
+        return Err("Закройте рабочий браузер и повторите исправление".into());
+    }
+    update_privacy_preferences(profile).map_err(|_| "Не удалось сохранить настройки профиля".into())
+}
+
+fn update_privacy_preferences(profile: &Path) -> io::Result<()> {
+    let directory = profile.join("Default");
+    let path = directory.join("Preferences");
+    (|| -> io::Result<()> {
+        for item in [&directory, &path] {
+            if fs::symlink_metadata(item).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                return Err(io::Error::other("Redirected preferences"));
+            }
+        }
+        prepare_preferences(profile)?;
+        let mut settings: serde_json::Value = serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
+        for (keys, value) in [
+            (&["profile", "default_content_setting_values", "geolocation"][..], serde_json::json!(2)),
+            (&["webrtc", "ip_handling_policy"][..], serde_json::json!(WEBRTC_POLICY)),
+        ] {
+            let mut entry = &mut settings;
+            for key in keys {
+                entry = entry.as_object_mut().ok_or_else(|| io::Error::other("Invalid preferences"))?
+                    .entry(*key).or_insert_with(|| serde_json::json!({}));
+            }
+            *entry = value;
+        }
+        let temporary = directory.join(format!(".workspace-{}-preferences", std::process::id()));
+        let mut output = OpenOptions::new().create_new(true).write(true).open(&temporary)?;
+        let written = output.write_all(settings.to_string().as_bytes()).and_then(|_| output.sync_all());
+        drop(output);
+        if let Err(error) = written.and_then(|_| fs::rename(&temporary, &path)) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(())
+    })()
+}
+
 fn find_browser() -> Option<PathBuf> {
     let paths: Vec<PathBuf> = if cfg!(target_os = "macos") {
         [
@@ -222,6 +263,22 @@ mod tests {
         prepare_preferences(&profile).unwrap();
         assert_eq!(fs::read(&path).unwrap(), br#"{"existing":true}"#);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repairs_privacy_preferences_without_resetting_other_fields() {
+        let profile = std::env::temp_dir().join(format!("workspace-privacy-test-{}", std::process::id()));
+        let default = profile.join("Default");
+        let path = default.join("Preferences");
+        fs::create_dir_all(&default).unwrap();
+        fs::write(&path, r#"{"profile":{"default_content_setting_values":{"geolocation":1,"camera":2}},"webrtc":{"ip_handling_policy":"default"},"homepage":"about:blank"}"#).unwrap();
+        update_privacy_preferences(&profile).unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(updated["profile"]["default_content_setting_values"]["geolocation"], 2);
+        assert_eq!(updated["profile"]["default_content_setting_values"]["camera"], 2);
+        assert_eq!(updated["webrtc"]["ip_handling_policy"], WEBRTC_POLICY);
+        assert_eq!(updated["homepage"], "about:blank");
+        fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]

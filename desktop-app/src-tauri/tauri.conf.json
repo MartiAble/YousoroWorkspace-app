@@ -1,0 +1,51 @@
+{
+  "productName": "Yousoro Workspace",
+  "version": "0.1.0",
+  "identifier": "ru.yousoro.workspace",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://127.0.0.1:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Yousoro Workspace",
+        "width": 1040,
+        "height": 700,
+        "minWidth": 760,
+        "minHeight": 520
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self'; img-src 'self' data:; object-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "dmg",
+      "nsis"
+    ],
+    "externalBin": [
+      "binaries/xray"
+    ],
+    "resources": [
+      "resources/"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico",
+      "icons/icon.icns"
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg3Nzk1NkUyOTgxRUIyQjMKUldTenNoNlk0bFo1aDZLMVpESE1IWVVpK251QWRYSVRjMW5hVWliUWg3SVc4aVFMd0hhelZ0eFkK",
+      "endpoints": []
+    }
+  }
+}

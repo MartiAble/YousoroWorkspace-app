@@ -1,0 +1,251 @@
+use std::{
+    ffi::OsString,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
+
+const WEBRTC_POLICY: &str = "disable_non_proxied_udp";
+
+pub fn regional_settings(region: &str) -> (&'static str, &'static str) {
+    match region.to_ascii_uppercase().as_str() {
+        "DE" => ("Europe/Berlin", "de-DE"),
+        "NL" => ("Europe/Amsterdam", "nl-NL"),
+        "GB" => ("Europe/London", "en-GB"),
+        "US" => ("America/New_York", "en-US"),
+        "TR" => ("Europe/Istanbul", "tr-TR"),
+        "KZ" => ("Asia/Almaty", "ru-KZ"),
+        _ => ("UTC", "en-US"),
+    }
+}
+
+pub fn profile_path(app_data: &Path, region: &str) -> Result<PathBuf, String> {
+    if region.is_empty() || region.len() > 16
+        || !region.bytes().all(|b| b.is_ascii_alphabetic() || b == b'-')
+    {
+        return Err("Некорректный регион".into());
+    }
+
+    let profiles = app_data.join("profiles");
+    let profile = profiles.join(region.to_ascii_lowercase());
+    for path in [&profiles, &profile] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err("Каталог профиля недоступен или перенаправлен".into()),
+        }
+    }
+    Ok(profile)
+}
+
+fn prepare_preferences(profile: &Path) -> io::Result<()> {
+    let directory = profile.join("Default");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("Preferences");
+    let preferences = serde_json::json!({
+        "profile": { "default_content_setting_values": { "geolocation": 2 } },
+        "webrtc": { "ip_handling_policy": WEBRTC_POLICY }
+    });
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(preferences.to_string().as_bytes()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn find_browser() -> Option<PathBuf> {
+    let paths: Vec<PathBuf> = if cfg!(target_os = "macos") {
+        [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ].into_iter().map(PathBuf::from).collect()
+    } else {
+        ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .flat_map(|root| {
+                let root = PathBuf::from(root);
+                [
+                    r"Google\Chrome\Application\chrome.exe",
+                    r"BraveSoftware\Brave-Browser\Application\brave.exe",
+                    r"Microsoft\Edge\Application\msedge.exe",
+                ].map(|path| root.join(path))
+            })
+            .collect()
+    };
+    paths.into_iter().find(|path| path.is_file())
+}
+
+pub fn proxied_command(executable: &Path, port: u16) -> Command {
+    let mut command = Command::new(executable);
+    command.arg(format!("--proxy-server=socks5://127.0.0.1:{port}"));
+    command
+}
+
+fn browser_command(browser: &Path, profile: &Path, port: u16, region: &str, url: &str, probe_port: Option<u16>) -> Command {
+    let (timezone, locale) = regional_settings(region);
+    let mut profile_arg = OsString::from("--user-data-dir=");
+    profile_arg.push(profile);
+
+    let mut command = proxied_command(browser, port);
+    let bypass = probe_port.map_or_else(|| "<-loopback>".into(), |port| format!("<-loopback>;127.0.0.1:{port}"));
+    command
+        .env("TZ", timezone)
+        .arg(profile_arg)
+        .arg(format!("--lang={locale}"))
+        .arg(format!("--webrtc-ip-handling-policy={WEBRTC_POLICY}"))
+        .arg(format!("--force-webrtc-ip-handling-policy={WEBRTC_POLICY}"))
+        .arg(format!("--proxy-bypass-list={bypass}"))
+        .args(["--disable-quic", "--no-first-run", "--no-default-browser-check", "--disable-background-mode", url]);
+    command
+}
+
+fn profile_in_command(line: &str, path: &Path) -> bool {
+    let marker = format!("--user-data-dir={}", path.display());
+    let (line, marker) = if cfg!(windows) {
+        (line.to_lowercase(), marker.to_lowercase())
+    } else {
+        (line.to_owned(), marker)
+    };
+    line.match_indices(&marker).any(|(index, matched)| {
+        let prefix = &line[..index];
+        let suffix = &line[index + matched.len()..];
+        (prefix.is_empty() || prefix.ends_with([' ', '"']))
+            && (suffix.is_empty() || suffix.starts_with([' ', '"']))
+    })
+}
+
+pub fn browser_process(profile: &Path) -> Result<Option<String>, String> {
+    let result = if cfg!(target_os = "macos") {
+        Command::new("/bin/ps").args(["-axww", "-o", "command="]).output()
+    } else {
+        powershell(r#"
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe' OR Name = 'brave.exe' OR Name = 'msedge.exe'" |
+    ForEach-Object { $_.CommandLine }
+"#).output()
+    };
+    let error = "Не удалось проверить, закрыт ли рабочий браузер";
+    let output = result.map_err(|_| error)?;
+    if !output.status.success() {
+        return Err(error.into());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().find(|line| profile_in_command(line, profile) && !line.contains("--type=")).map(str::to_owned))
+}
+
+pub fn launch_browser(profile: &Path, port: u16, region: &str, url: &str, probe: &crate::radar::BrowserProbe) -> Result<(), String> {
+    let browser = find_browser().ok_or("Установите Chrome, Brave или Microsoft Edge")?;
+    if browser_process(profile)?.is_some() {
+        return Err("Закройте рабочий браузер этого региона перед повторным запуском".into());
+    }
+    prepare_preferences(profile).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
+    let endpoint = probe.start(port, region, url).ok();
+    let (startup_url, probe_port) = endpoint.as_ref().map_or((url, None), |probe| (probe.url.as_str(), Some(probe.port)));
+    let command = browser_command(&browser, profile, port, region, startup_url, probe_port);
+    spawn(command)
+        .map_err(|_| "Не удалось запустить браузер".into())
+}
+
+pub fn clear_browser_profile(profile: &Path) -> Result<(), String> {
+    if !profile.exists() {
+        return Ok(());
+    }
+    if browser_process(profile)?.is_some() {
+        return Err("Закройте рабочий браузер этого региона перед очисткой профиля".into());
+    }
+    fs::remove_dir_all(profile).map_err(|_| "Не удалось очистить рабочий профиль".into())
+}
+
+pub fn powershell(script: &str) -> Command {
+    let mut command = Command::new(PathBuf::from(
+        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())
+    ).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
+pub fn spawn(mut command: Command) -> io::Result<()> {
+    let mut child = command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    std::thread::spawn(move || { let _ = child.wait(); });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn maps_regions_and_unknown_codes() {
+        for (region, timezone, language) in [
+            ("DE", "Europe/Berlin", "de-DE"),
+            ("nl", "Europe/Amsterdam", "nl-NL"),
+            ("GB", "Europe/London", "en-GB"),
+            ("us", "America/New_York", "en-US"),
+            ("TR", "Europe/Istanbul", "tr-TR"),
+            ("kz", "Asia/Almaty", "ru-KZ"),
+            ("FR", "UTC", "en-US"),
+        ] {
+            assert_eq!(regional_settings(region), (timezone, language));
+        }
+    }
+
+    #[test]
+    fn creates_preferences_once_and_preserves_existing_settings() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("workspace-{}-{nonce}", std::process::id()));
+        let profile = profile_path(&root, "DE").unwrap();
+        let path = profile.join("Default/Preferences");
+        assert_eq!(profile, root.join("profiles/de"));
+        assert!(profile_path(&root, "../de").is_err());
+        assert!(profile_path(&root, "").is_err());
+        prepare_preferences(&profile).unwrap();
+        let settings: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(settings["profile"]["default_content_setting_values"]["geolocation"], 2);
+        assert_eq!(settings["webrtc"]["ip_handling_policy"], WEBRTC_POLICY);
+        fs::write(&path, br#"{"existing":true}"#).unwrap();
+        prepare_preferences(&profile).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"{"existing":true}"#);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn browser_passes_regional_privacy_and_proxy_settings() {
+        let command = browser_command(Path::new("browser"), Path::new("Profile with spaces"), 10081, "tr", "https://example.invalid", None);
+        let args: Vec<_> = command.get_args().collect();
+        for expected in [
+            "--user-data-dir=Profile with spaces",
+            "--proxy-server=socks5://127.0.0.1:10081",
+            "--lang=tr-TR",
+            "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ] {
+            assert!(args.iter().any(|arg| *arg == expected));
+        }
+        assert!(command.get_envs().any(|(key, value)| key == "TZ" && value.unwrap() == "Europe/Istanbul"));
+    }
+
+    #[test]
+    fn profile_check_distinguishes_regional_paths() {
+        let path = Path::new("Profile with spaces/de");
+        assert!(profile_in_command(r#"chrome "--user-data-dir=Profile with spaces/de" --lang=de-DE"#, path));
+        assert!(profile_in_command("chrome --user-data-dir=Profile with spaces/de --lang=de-DE", path));
+        assert!(!profile_in_command("chrome --user-data-dir=Profile with spaces/de-alt", path));
+    }
+
+}

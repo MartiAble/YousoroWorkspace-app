@@ -1,0 +1,336 @@
+use crate::{apps, dns_radar, launch, service, system_proxy};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::{
+    fs, io::{BufRead, BufReader, Read, Write},
+    net::{Ipv4Addr, TcpListener, TcpStream}, path::Path,
+    sync::{Arc, Mutex}, time::{Duration, Instant},
+};
+
+const DIAGNOSTICS: &str = service::DIAGNOSTICS_ORIGIN;
+
+#[derive(Serialize)]
+pub struct Observation {
+    ip: Ipv4Addr,
+    latency_ms: u64,
+}
+
+fn public_ipv4(value: &str) -> Option<Ipv4Addr> {
+    let ip: Ipv4Addr = value.parse().ok()?;
+    let [a, b, c, _] = ip.octets();
+    (!ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_documentation()
+        && !ip.is_multicast() && a != 0 && a < 240 && !(a == 100 && (64..128).contains(&b))
+        && !(a == 198 && (18..=19).contains(&b)) && !(a == 192 && b == 0 && c == 0)).then_some(ip)
+}
+
+fn client(port: u16) -> Result<reqwest::blocking::Client, String> {
+    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).map_err(|_| "Некорректный адрес прокси")?;
+    reqwest::blocking::Client::builder().proxy(proxy).timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Не удалось настроить диагностику".into())
+}
+
+fn observe(client: &reqwest::blocking::Client) -> Result<Observation, String> {
+    let started = Instant::now();
+    let result: Value = service::checked(client.get(format!("{DIAGNOSTICS}/api/network-observe")).send())?
+        .json().map_err(|_| "Сервер не вернул адрес")?;
+    let ip = result["ip"].as_str().and_then(public_ipv4).ok_or("Сервер диагностики не увидел публичный IPv4")?;
+    Ok(Observation { ip, latency_ms: started.elapsed().as_millis() as u64 })
+}
+
+pub fn observe_tunnel(port: u16) -> Result<Observation, String> {
+    observe(&client(port)?)
+}
+
+#[derive(Serialize, Deserialize)]
+struct Geo {
+    country: Option<String>,
+    city: Option<String>,
+    connection: Option<Provider>,
+}
+#[derive(Serialize, Deserialize)]
+struct Provider {
+    isp: Option<String>,
+    asn: Option<u32>,
+}
+
+fn geoip(ip: Ipv4Addr) -> Option<Geo> {
+    let result: Value = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none()).build().ok()?
+        .get(format!("https://ipwho.is/{ip}")).send().ok()?.error_for_status().ok()?.json().ok()?;
+    if result["success"] != true || result["ip"].as_str()?.parse::<Ipv4Addr>().ok()? != ip { return None; }
+    serde_json::from_value(result).ok()
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct BrowserObservation {
+    timezone: String,
+    language: String,
+}
+
+#[derive(Default, Clone)]
+pub struct BrowserProbe(Arc<Mutex<Option<(u16, String, u64, Option<BrowserObservation>)>>>);
+
+pub struct ProbeEndpoint {
+    pub url: String,
+    pub port: u16,
+}
+
+impl BrowserProbe {
+    pub fn start(&self, port: u16, region: &str, destination: &str) -> std::io::Result<ProbeEndpoint> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let local = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
+        use std::hash::{BuildHasher, RandomState};
+        let token = RandomState::new().hash_one((Instant::now(), local));
+        let path = format!("/{token:016x}");
+        let host = format!("127.0.0.1:{local}");
+        let url = format!("http://{host}{path}");
+        let redirect = serde_json::to_string(destination).unwrap_or_else(|_| "\"about:blank\"".into());
+        let html = format!(r#"<!doctype html><meta charset="utf-8"><title>Yousoro Workspace</title>
+<script>
+const next = {redirect};
+const go = () => location.replace(next);
+setTimeout(go, 1500);
+fetch(location.pathname, {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{
+  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, language: navigator.language
+}})}}).finally(go);
+</script><p>Открываем рабочую страницу…</p>"#);
+        let region = region.to_owned();
+        let probe = self.clone();
+        if let Ok(mut previous) = self.0.lock() { *previous = Some((port, region, token, None)); }
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(25);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Ok(Some(data)) = probe_request(stream, &path, &host, &html) {
+                            if let Ok(mut value) = probe.0.lock() {
+                                if let Some((_, _, current_token, observed)) = value.as_mut() {
+                                    if *current_token == token { *observed = Some(data); }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(40)),
+                    Err(_) => break,
+                }
+            }
+        });
+        Ok(ProbeEndpoint { url, port: local })
+    }
+
+    fn observation(&self, port: u16, region: &str) -> Option<BrowserObservation> {
+        let guard = self.0.lock().ok()?;
+        let (observed_port, observed_region, _, value) = guard.as_ref()?;
+        (*observed_port == port && observed_region == region).then(|| value.clone()).flatten()
+    }
+}
+
+fn probe_request(mut stream: TcpStream, path: &str, host: &str, html: &str) -> std::io::Result<Option<BrowserObservation>> {
+    stream.set_read_timeout(Some(Duration::from_millis(350)))?;
+    stream.set_write_timeout(Some(Duration::from_millis(350)))?;
+    let mut reader = BufReader::new(stream.try_clone()?.take(8192));
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let mut words = line.split_whitespace();
+    let method = words.next().unwrap_or("");
+    if words.next() != Some(path) { return Ok(None); }
+    let mut host_matches = false;
+    let mut origin_matches = false;
+    let mut length = 0;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header)? == 0 || header.trim().is_empty() { break; }
+        if let Some((key, value)) = header.trim().split_once(':') {
+            match key.to_ascii_lowercase().as_str() {
+                "host" => host_matches = value.trim() == host,
+                "origin" => origin_matches = value.trim() == format!("http://{host}"),
+                "content-length" => length = value.trim().parse::<usize>().unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    if !host_matches { return Ok(None); }
+    if method == "GET" {
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; script-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{html}", html.len())?;
+    } else if method == "POST" && origin_matches && (1..=256).contains(&length) {
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body)?;
+        let value: Option<BrowserObservation> = serde_json::from_slice(&body).ok();
+        if value.as_ref().is_some_and(|data| [data.timezone.as_str(), data.language.as_str()]
+            .iter().all(|part| !part.is_empty() && part.len() < 64
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"/+-_".contains(&b)))) {
+            stream.write_all(b"HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
+            return Ok(value);
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Serialize)]
+struct Browser {
+    running: Option<bool>,
+    expected_timezone: &'static str,
+    expected_language: &'static str,
+    actual: Option<BrowserObservation>,
+    launch_language: Option<String>,
+    geolocation_blocked: Option<bool>,
+    webrtc_protected: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct DeviceSlots {
+    used: usize,
+    limit: u64,
+    desktop: usize,
+    mobile: usize,
+    current_pc: Option<bool>,
+}
+
+fn device_slots(bound: &service::Devices, device_id: Option<&str>) -> DeviceSlots {
+    let desktop = bound.items.iter().filter(|device| matches!(device.os.as_str(), "windows" | "macos" | "linux")).count();
+    let mobile = bound.items.iter().filter(|device| matches!(device.os.as_str(), "ios" | "android")).count();
+    DeviceSlots {
+        used: bound.items.len(),
+        limit: bound.limit,
+        desktop,
+        mobile,
+        current_pc: device_id.map(|id| bound.items.iter().any(|device| device.id == id)),
+    }
+}
+
+#[derive(Serialize)]
+pub struct Report {
+    network: Option<Observation>,
+    network_error: Option<String>,
+    matched: Option<bool>,
+    geo: Option<Geo>,
+    dns: Option<dns_radar::DnsReport>,
+    devices: Option<DeviceSlots>,
+    browser: Browser,
+    timezone: Option<String>,
+    system_proxy: Option<bool>,
+    apps: apps::InstalledApps,
+    ready: usize,
+    total: usize,
+    hints: Vec<&'static str>,
+}
+
+fn system_timezone() -> Option<String> {
+    if cfg!(windows) {
+        let output = launch::powershell("(Get-TimeZone).Id").output().ok()?;
+        return output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    }
+    let link = fs::read_link("/etc/localtime").ok()?;
+    link.to_str()?.split_once("zoneinfo/").map(|(_, zone)| zone.to_owned())
+}
+
+pub fn report(port: u16, region: &str, app_data: &Path, probe: &BrowserProbe, lookup_geo: bool, check_dns: bool, device_id: Option<&str>) -> Report {
+    let session = service::Session::restore().ok();
+    let (network, network_error, matched, geo) = match client(port) {
+        Ok(client) => match observe(&client) {
+            Ok(observation) => {
+                let matched = session.as_ref().and_then(|session| {
+                    let response = session.authorize(client.get(format!("{DIAGNOSTICS}/api/tunnel-check"))).send();
+                    let data = service::checked(response).ok()?.json::<Value>().ok()?;
+                    (data["known"] == true).then(|| data["via_gateway"].as_bool()).flatten()
+                });
+                let geo = lookup_geo.then(|| geoip(observation.ip)).flatten();
+                (Some(observation), None, matched, geo)
+            }
+            Err(error) => (None, Some(error), None, None),
+        },
+        Err(error) => (None, Some(error), None, None),
+    };
+
+    let (expected_timezone, expected_language) = launch::regional_settings(region);
+    let profile = launch::profile_path(app_data, region).ok();
+    let process = profile.as_ref().and_then(|path| launch::browser_process(path).ok());
+    let running = process.as_ref().map(Option::is_some);
+    let command = process.as_ref().and_then(Option::as_deref);
+    let launch_language = command.and_then(|command| command.split_whitespace().find_map(|arg|
+        arg.trim_matches('"').strip_prefix("--lang=").map(str::to_owned)));
+    let preferences = profile.and_then(|path| fs::read(path.join("Default/Preferences")).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let geolocation_blocked = preferences.as_ref().and_then(|value| value["profile"]["default_content_setting_values"]["geolocation"].as_u64())
+        .map(|setting| setting == 2);
+    let webrtc_protected = command.map(|command| command.split_whitespace().any(|flag|
+        flag.trim_matches('"') == "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"))
+        .or_else(|| preferences.as_ref().and_then(|value| value["webrtc"]["ip_handling_policy"].as_str())
+            .map(|setting| setting == "disable_non_proxied_udp"));
+    let actual = (running == Some(true)).then(|| probe.observation(port, region)).flatten();
+    let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected };
+    let system_proxy = system_proxy::active(port);
+    let apps = apps::installed_apps(Some(port), system_proxy == Some(true));
+
+    let dns = check_dns.then(|| dns_radar::check(port));
+    let devices = session.as_ref().and_then(|session| service::account(session).ok())
+        .map(|account| device_slots(&account.bound, device_id));
+    let checks = [
+        (network.is_some(), "Проверьте, что туннель подключён и сервер диагностики доступен."),
+        (matched == Some(true), "Подождите, пока регион применится, затем переподключите туннель и повторите сверку узла."),
+        (browser.actual.as_ref().is_some_and(|data| data.timezone == expected_timezone && data.language.eq_ignore_ascii_case(expected_language)),
+            "Перезапустите рабочий браузер из Workspace. Если Windows сохраняет системный часовой пояс, сравните его с регионом."),
+        (geolocation_blocked == Some(true), "Проверьте запрет геолокации в настройках рабочего профиля."),
+        (webrtc_protected == Some(true), "Откройте браузер через Workspace, чтобы применить ограничение WebRTC."),
+        (dns.as_ref().is_some_and(|result| result.distinct()), if check_dns {
+            "Проверка DNS не подтвердила различие резолверов. Убедитесь, что проверочный сервис доступен через узел."
+        } else { "Включите проверку DNS, чтобы сравнить резолверы." }),
+        (devices.as_ref().is_some_and(|slots| slots.current_pc == Some(true)),
+            "Текущий ПК не подтверждён в активных слотах. Обновите данные и проверьте устройства в кабинете."),
+        (devices.as_ref().is_some_and(|slots| slots.mobile > 0),
+            "Если вы используете Workspace на телефоне, подключите его через веб-кабинет."),
+    ];
+    let mut total = checks.len();
+    let mut ready = checks.iter().filter(|(passed, _)| *passed).count();
+    let mut hints: Vec<_> = checks.iter().filter_map(|(passed, hint)| (!passed).then_some(*hint)).collect();
+    if apps.chatgpt.as_ref().is_some_and(|app| app.store) || apps.claude.as_ref().is_some_and(|app| app.store) {
+        total += 1;
+        if system_proxy == Some(true) { ready += 1; }
+        else { hints.push("Включите системный прокси Windows для клиентов из Microsoft Store."); }
+    }
+    Report { network, network_error, matched, geo, dns, devices, browser, timezone: system_timezone(), system_proxy, apps, ready, total, hints }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_loopback_and_private_gateway_addresses() {
+        for address in ["127.0.0.1", "10.2.3.4", "172.16.1.1", "100.64.2.1", "::1", "203.0.113.5"] {
+            assert_eq!(public_ipv4(address), None);
+        }
+        assert_eq!(public_ipv4("8.8.8.8"), Some(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn counts_desktop_and_mobile_and_matches_only_the_current_pc() {
+        let devices: service::Devices = serde_json::from_value(serde_json::json!({"limit":3,"items":[
+            {"id":"a","name":"PC","os":"windows"},{"id":"b","name":"Phone","os":"android"}
+        ]})).unwrap();
+        let slots = device_slots(&devices, Some("a"));
+        assert_eq!((slots.used, slots.desktop, slots.mobile), (2, 1, 1));
+        assert_eq!(slots.current_pc, Some(true));
+        assert_eq!(device_slots(&devices, Some("revoked")).current_pc, Some(false));
+    }
+
+    #[test]
+    fn report_keeps_unknown_distinct_from_failed_and_includes_readiness() {
+        let report = Report {
+            network: Some(Observation { ip: "8.8.8.8".parse().unwrap(), latency_ms: 123 }),
+            network_error: None, matched: Some(false), geo: None, dns: None, devices: None,
+            browser: Browser { running: Some(true), expected_timezone: "Europe/Berlin", expected_language: "de-DE",
+                actual: None, launch_language: Some("de-DE".into()), geolocation_blocked: Some(false), webrtc_protected: None },
+            timezone: None, system_proxy: Some(false),
+            apps: apps::InstalledApps { claude: None, chatgpt: None }, ready: 1, total: 5, hints: vec!["hint"],
+        };
+        let json = serde_json::to_value(report).unwrap();
+        assert_eq!(json["network"]["ip"], "8.8.8.8");
+        assert_eq!(json["network"]["latency_ms"], 123);
+        assert_eq!(json["matched"], false);
+        assert!(json["browser"]["actual"].is_null());
+        assert_eq!(json["total"], 5);
+    }
+}

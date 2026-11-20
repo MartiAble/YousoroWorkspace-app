@@ -4,30 +4,38 @@ import {invoke} from '@tauri-apps/api/core';
 import {check, Update} from '@tauri-apps/plugin-updater';
 import {relaunch} from '@tauri-apps/plugin-process';
 
+const FOUR_HOURS = 4 * 60 * 60 * 1000;
+const AUTO_CHECK = 'workspace.autoUpdate';
+
 export function useAppUpdates(native: boolean) {
   const [version,setVersion] = useState('');
   const [available,setAvailable] = useState<Update|null>(null);
   const [phase,setPhase] = useState<'idle'|'checking'|'downloading'|'installing'>('idle');
-  const [progress,setProgress] = useState<number|null>(null);
-  const [message,setMessage] = useState('');
+  const [transfer,setTransfer] = useState({ bytes:0, total:0, finished:false });
+  const [message,setMessage] = useState('Проверка ещё не выполнялась');
+  const [lastCheck,setLastCheck] = useState<Date|null>(null);
+  const [visible,setVisible] = useState(false);
+  const [automatic,setAutomatic] = useState(() => localStorage.getItem(AUTO_CHECK) !== 'off');
   const current = useRef<Update|null>(null);
   const lock = useRef(false);
 
-  const refresh = useCallback(async (manual = false) => {
+  const refresh = useCallback(async () => {
     if (!native || lock.current) return;
     lock.current = true;
     setPhase('checking');
-    setMessage('');
+    setMessage('Проверяем канал обновлений…');
     try {
       const next = await check({timeout: 12000});
       const old = current.current;
       current.current = next;
       setAvailable(next);
+      setVisible(next ? await invoke<boolean>('update_notice',{version:next.version,dismiss:false}).catch(() => true) : false);
       if (old) await old.close().catch(() => {});
-      if (!next && manual) setMessage('Установлена актуальная версия.');
+      setMessage(next ? 'Обновление готово к скачиванию' : 'Установлена актуальная версия');
     } catch {
-      if (manual) setMessage('Канал обновлений недоступен. Повторите проверку позже.');
+      setMessage('Канал обновлений недоступен. Проверьте сеть и повторите попытку.');
     } finally {
+      setLastCheck(new Date());
       lock.current = false;
       setPhase('idle');
     }
@@ -36,74 +44,90 @@ export function useAppUpdates(native: boolean) {
   useEffect(() => {
     if (!native) return;
     void getVersion().then(setVersion).catch(() => {});
-    void refresh();
     return () => { void current.current?.close().catch(() => {}); };
-  }, [native, refresh]);
+  }, [native]);
+  useEffect(() => {
+    if (!native || !automatic) return;
+    const first = window.setTimeout(() => void refresh(), 2500);
+    const periodic = window.setInterval(() => void refresh(), FOUR_HOURS);
+    return () => { window.clearTimeout(first); window.clearInterval(periodic); };
+  }, [native, automatic, refresh]);
 
+  function autoCheck(enabled: boolean) {
+    localStorage.setItem(AUTO_CHECK, enabled ? 'on' : 'off');
+    setAutomatic(enabled);
+  }
+  function later() {
+    if (!current.current) return;
+    void invoke('update_notice',{version:current.current.version,dismiss:true}).catch(() => {});
+    setVisible(false);
+  }
   async function install() {
     const update = current.current;
     if (!update || lock.current) return;
     lock.current = true;
     setPhase('downloading');
-    setMessage('');
-    setProgress(null);
-    let total = 0;
-    let downloaded = 0;
+    setMessage('Скачиваем обновление…');
+    setTransfer({ bytes:0, total:0, finished:false });
     try {
       await update.download(event => {
-        if (event.event==='Started') {
-          total = event.data.contentLength || 0;
-          if (total) setProgress(0);
-        }
-        if (event.event==='Progress') {
-          downloaded += event.data.chunkLength;
-          if (total) setProgress(Math.min(99, Math.floor(downloaded * 100 / total)));
-        }
-        if (event.event==='Finished') setProgress(100);
+        if (event.event === 'Started') setTransfer({bytes:0,total:event.data.contentLength || 0,finished:false});
+        if (event.event === 'Progress') setTransfer(value => ({...value,bytes:value.bytes + event.data.chunkLength}));
+        if (event.event === 'Finished') setTransfer(value => ({...value,finished:true}));
       });
       setPhase('installing');
-      // Restore the Windows proxy before NSIS terminates this process.
       const {system_proxy_supported: windows} = await invoke<{system_proxy_supported:boolean}>('disconnect');
-      await update.install({restartAfterInstall: true});
+      await update.install({restartAfterInstall:true});
       if (!windows) await relaunch();
     } catch {
-      setMessage('Обновление не установлено. Проверьте соединение и состояние туннеля, затем повторите попытку.');
+      setMessage('Не удалось установить обновление. Проверьте сеть и повторите попытку.');
     } finally {
       lock.current = false;
       setPhase('idle');
     }
   }
 
-  return {version, available, phase, progress, message, refresh, install};
+  return {version, available, phase, transfer, message, lastCheck, visible, automatic, autoCheck, later, refresh, install};
 }
 
 type Updates = ReturnType<typeof useAppUpdates>;
+const megabytes = new Intl.NumberFormat('ru', {maximumFractionDigits:1});
 
 export function UpdateProgress({updates}:{updates:Updates}) {
   if (updates.phase !== 'downloading' && updates.phase !== 'installing') return null;
+  const { bytes, total, finished } = updates.transfer;
+  const progress = finished ? 100 : total ? Math.min(99, Math.floor(bytes * 100 / total)) : undefined;
+  const size = megabytes.format(bytes / 1048576) + (total ? ' из ' + megabytes.format(total / 1048576) : '') + ' МБ';
   return <div className="update-progress" role="status">
-    {updates.phase==='installing' ? 'Установка обновления…' :
-      updates.progress===null ? 'Скачивание…' : 'Скачивание · '+updates.progress+'%'}
-    <progress aria-label="Скачивание обновления" max={100} value={updates.progress??undefined}/>
+    <span>{updates.phase === 'installing' ? 'Устанавливаем обновление' : 'Скачивание'}{progress !== undefined ? ' · ' + progress + '%' : ''} · {size}</span>
+    <progress aria-label="Скачивание обновления" max={100} value={progress}/>
   </div>;
 }
 
-export function UpdateSettings({updates,busy}:{updates:Updates;busy:boolean}) {
-  return <section className="panel diagnostics update-settings">
-    <h2>Обновления приложения</h2>
-    <p>Текущая версия {updates.version ? 'v'+updates.version : 'недоступна'}</p>
-    {updates.available && <>
-      <p><strong>Доступна v{updates.available.version}</strong></p>
-      {updates.available.body && <p className="update-notes">{updates.available.body}</p>}
-    </>}
-    <UpdateProgress updates={updates}/>
-    {updates.message && <p role="status">{updates.message}</p>}
-    <div className="actions">
-      <button disabled={busy || updates.phase!=='idle'} onClick={()=>void updates.refresh(true)}>
-        {updates.phase==='checking'?'Проверяем…':'Проверить обновления'}
-      </button>
-      {updates.available && <button className="primary" disabled={busy || updates.phase!=='idle'}
-        onClick={()=>void updates.install()}>Обновить и перезапустить</button>}
+export function UpdateBanner({updates,busy}:{updates:Updates;busy:boolean}) {
+  if (!updates.visible || !updates.available) return null;
+  return <section className="update-banner" aria-label="Доступно обновление">
+    <div><strong>Доступно обновление v{updates.available.version}</strong>
+      {updates.available.body && <p className="update-excerpt">{updates.available.body}</p>}
     </div>
+    {updates.phase === 'idle' || updates.phase === 'checking' ? <div className="update-banner-actions">
+      <button className="primary" disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.install()}>Обновить и перезапустить</button>
+      <button className="quiet" onClick={updates.later}>Позже</button>
+    </div> : <UpdateProgress updates={updates}/>}
+    {updates.message.startsWith('Не удалось') && <p className="update-error" role="alert">{updates.message}</p>}
+  </section>;
+}
+
+export function UpdateSettings({updates,busy}:{updates:Updates;busy:boolean}) {
+  return <section className="panel update-settings">
+    <div className="section-heading"><h2>Обновления приложения</h2><span className="chip">{updates.version ? 'v'+updates.version : 'Версия неизвестна'}</span></div>
+    <p role="status">{updates.message}{updates.lastCheck && ' · ' + updates.lastCheck.toLocaleString('ru', {dateStyle:'short',timeStyle:'short'})}</p>
+    {updates.available?.body && <details className="release-notes"><summary>Изменения в v{updates.available.version}</summary><p className="update-notes">{updates.available.body}</p></details>}
+    {!updates.visible && <UpdateProgress updates={updates}/>}
+    <div className="actions">
+      <button disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.refresh()}>Проверить обновления</button>
+      {updates.available && <button disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.install()}>Обновить и перезапустить</button>}
+    </div>
+    <label className="toggle-row"><span>Автоматически проверять обновления</span><input type="checkbox" role="switch" checked={updates.automatic} onChange={e=>updates.autoCheck(e.target.checked)}/></label>
   </section>;
 }

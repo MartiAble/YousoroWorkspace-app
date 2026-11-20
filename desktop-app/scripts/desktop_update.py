@@ -19,7 +19,8 @@ def https_base(value):
 
 
 def configure(args):
-    endpoints = [https_base(args.base) + "/latest.json"] if args.base.strip() else []
+    base = args.base.strip() or "https://github.com/MartiAble/YousoroWorkspace-app/releases/latest/download"
+    endpoints = [https_base(base) + "/latest.json"]
     args.output.write_text(json.dumps({"plugins": {"updater": {"endpoints": endpoints}}}), encoding="utf-8")
 
 

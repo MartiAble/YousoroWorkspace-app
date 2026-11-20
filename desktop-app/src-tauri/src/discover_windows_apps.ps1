@@ -12,12 +12,11 @@ $list = @($processes | ForEach-Object {
     $process = $_
     @{ id = $process.Id; path = $process.Path; command = $commands[$process.Id] }
 })
-$packagePattern = if ($name -eq 'Claude') { '(^|[.])Claude($|[.\-])' } else { '^OpenAI[.](ChatGPT($|[-.])|Codex($|_))' }
+$packagePattern = if ($name -eq 'Claude') { '(^|[.])Claude($|[._\-])' } else { '^OpenAI[.](ChatGPT($|[-._])|Codex($|_))' }
 $packages = @(Get-AppxPackage -Name "*$name*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match $packagePattern })
 if ($name -eq 'ChatGPT') { $packages += @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue) }
 $start = @(Get-StartApps -ErrorAction SilentlyContinue | Where-Object {
-    $_.AppID -match $packagePattern -and $_.AppID -like '*!*' -and
-        ($_.AppID -notlike 'OpenAI.Codex_*' -or $_.Name -eq 'ChatGPT')
+    $_.AppID -match $packagePattern -and $_.AppID -like '*!*'
 })
 $application = $null
 foreach ($package in $packages) {
@@ -25,15 +24,30 @@ foreach ($package in $packages) {
     if ($match) { $application = $match.AppID; break }
     $manifest = Get-AppxPackageManifest -Package $package.PackageFullName -ErrorAction SilentlyContinue
     $entries = @($manifest.Package.Applications.Application | Where-Object { $_.Id })
-    if ($package.Name -eq 'OpenAI.Codex') {
-        $entries = @($entries | Where-Object { [IO.Path]::GetFileName($_.Executable) -eq $exe })
-    }
     $entry = $entries | Where-Object { $_.Id -eq 'App' -or [IO.Path]::GetFileName($_.Executable) -eq $exe } | Select-Object -First 1
     if (!$entry) { $entry = $entries | Select-Object -First 1 }
     if ($entry) { $application = "$($package.PackageFamilyName)!$($entry.Id)"; break }
 }
 if (!$application -and $start.Count) { $application = $start[0].AppID }
+if ($application) {
+    $family = ($application -split '!', 2)[0]
+    $selectedPackage = $packages | Where-Object { $_.PackageFamilyName -eq $family } | Select-Object -First 1
+    if ($selectedPackage -and $selectedPackage.InstallLocation) {
+        $prefix = $selectedPackage.InstallLocation.TrimEnd('\') + '\'
+        $sessionId = (Get-Process -Id $PID).SessionId
+        $seen = @($list | ForEach-Object { $_.id })
+        $packageProcesses = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.SessionId -eq $sessionId -and $seen -notcontains $_.Id -and
+            $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
+            ($_.ProcessName -in @($name, 'Codex'))
+        }
+        $list += @($packageProcesses | ForEach-Object { @{ id = $_.Id; path = $_.Path; command = $null } })
+    }
+}
 $paths = @()
+foreach ($root in @($env:ProgramFiles, [Environment]::GetEnvironmentVariable('ProgramFiles(x86)'))) {
+    if ($root) { $paths += (Join-Path $root "$name\$exe"), (Join-Path $root "OpenAI\$name\$exe") }
+}
 if ($name -eq 'Claude') {
     $paths += "$env:LOCALAPPDATA\AnthropicClaude\claude.exe", "$env:LOCALAPPDATA\Programs\Claude\Claude.exe"
     $keys = @(
@@ -64,4 +78,4 @@ $paths = @($paths + @($list | ForEach-Object { $_.path }) | Where-Object {
     $_ -and [IO.Path]::IsPathRooted($_) -and [IO.Path]::GetFileName($_) -eq $exe -and
         $_ -notmatch '\\WindowsApps\\' -and (Test-Path -LiteralPath $_ -PathType Leaf)
 })
-@{ package = $application; registered = [bool]$application; paths = @($paths); processes = @($list) } | ConvertTo-Json -Depth 4 -Compress
+@{ package = $application; registered = [bool]($application -or $packages.Count); paths = @($paths); processes = @($list) } | ConvertTo-Json -Depth 4 -Compress

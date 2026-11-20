@@ -59,14 +59,17 @@ impl Discovery {
 
     fn status(&self, port: Option<u16>, system_proxy: bool) -> DesktopStatus {
         let running = !self.processes.is_empty();
-        let store = self.registered || self.package.is_some();
+        let target = self.target();
+        let store = matches!(target, Some(Target::Appx(_)));
         let proxy = port.is_some_and(|port| self.processes.iter().any(|p|
             p.command.as_deref().is_some_and(|cmd| {
                 let expected = format!("--proxy-server=socks5://127.0.0.1:{port}");
                 cmd.split_whitespace().any(|arg| arg.trim_matches('"') == expected)
             })));
         DesktopStatus {
-            installed: running || store || !self.paths.is_empty(),
+            installed: running || self.registered || target.is_some(),
+            can_launch: target.is_some(),
+            variant: self.package.as_deref().filter(|id| id.starts_with("OpenAI.Codex_")).map(|_| "Codex Desktop"),
             running,
             store,
             proxy: if proxy { "arguments" } else if running && store && system_proxy { "system" } else { "unknown" },
@@ -118,6 +121,8 @@ fn discover(app: DesktopApp) -> Result<Discovery, String> {
 #[derive(Serialize)]
 pub struct DesktopStatus {
     pub installed: bool,
+    pub can_launch: bool,
+    pub variant: Option<&'static str>,
     pub running: bool,
     pub store: bool,
     pub proxy: &'static str,
@@ -145,14 +150,14 @@ fn desktop_command(executable: &Path, port: u16) -> Command {
 }
 
 fn close_for_restart(app: DesktopApp, running: &[Process]) -> Result<(), String> {
+    let ids = running.iter().map(|p| p.id.to_string()).collect::<Vec<_>>().join(",");
     if cfg!(windows) {
-        let ids = running.iter().map(|p| p.id.to_string()).collect::<Vec<_>>().join(",");
         powershell(r#"
 $ids = $env:WORKSPACE_CLOSE_PIDS -split ',' | ForEach-Object { [int]$_ }
-Get-Process -Name $env:WORKSPACE_DESKTOP_APP -ErrorAction SilentlyContinue |
-    Where-Object { $ids -contains $_.Id -and $_.MainWindowHandle -ne 0 } |
+Get-Process -Id $ids -ErrorAction SilentlyContinue |
+    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId -and $_.MainWindowHandle -ne 0 } |
     ForEach-Object { $null = $_.CloseMainWindow() }
-"#).env("WORKSPACE_DESKTOP_APP", app.name()).env("WORKSPACE_CLOSE_PIDS", ids)
+"#).env("WORKSPACE_CLOSE_PIDS", &ids)
             .output().map_err(|_| "Не удалось закрыть окно клиента")?;
     } else {
         for process in running {
@@ -164,12 +169,13 @@ Get-Process -Name $env:WORKSPACE_DESKTOP_APP -ErrorAction SilentlyContinue |
     if cfg!(windows) {
         let output = powershell(r#"
 $session = (Get-Process -Id $PID).SessionId
+$ids = $env:WORKSPACE_CLOSE_PIDS -split ',' | ForEach-Object { [int]$_ }
 for ($i = 0; $i -lt 20; $i++) {
-    if (!(Get-Process -Name $env:WORKSPACE_DESKTOP_APP -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })) { exit 0 }
+    if (!(Get-Process -Id $ids -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })) { exit 0 }
     Start-Sleep -Milliseconds 250
 }
 exit 1
-"#).env("WORKSPACE_DESKTOP_APP", app.name()).status()
+"#).env("WORKSPACE_CLOSE_PIDS", &ids).status()
             .map_err(|_| "Не удалось проверить закрытие клиента")?;
         if output.success() { return Ok(()); }
     } else {
@@ -181,12 +187,9 @@ exit 1
     Err(format!("Клиент {} остался запущен в фоне. Полностью закройте его и повторите запуск.", app.name()))
 }
 
-pub fn launch(app: DesktopApp, port: u16, system_proxy: bool, restart: bool) -> Result<(), String> {
+pub fn launch(app: DesktopApp, port: u16, restart: bool, enable_store_proxy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     let discovery = discover(app)?;
     let target = discovery.target().ok_or("Не найден доступный способ запуска клиента")?;
-    if matches!(target, Target::Appx(_)) && !system_proxy {
-        return Err("Для приложения Microsoft Store включите системный прокси Windows в рабочем маршруте".into());
-    }
     if !discovery.processes.is_empty() {
         if !restart { return Err("Клиент уже запущен. Выберите перезапуск через туннель.".into()); }
         close_for_restart(app, &discovery.processes)?;
@@ -194,6 +197,7 @@ pub fn launch(app: DesktopApp, port: u16, system_proxy: bool, restart: bool) -> 
     let command = match target {
         Target::Executable(path) => desktop_command(&path, port),
         Target::Appx(id) => {
+            enable_store_proxy()?;
             let mut command = Command::new(PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("explorer.exe"));
             command.arg(format!(r"shell:AppsFolder\{id}"));
             command
@@ -217,6 +221,19 @@ mod tests {
         assert_eq!(found.status(Some(10081), false).proxy, "unknown");
         assert!(valid_aumid("OpenAI.Codex_2p2nqsd0c76g0!App"));
         assert!(!valid_aumid("bad\\path!App"));
+    }
+
+    #[test]
+    fn store_launcher_does_not_require_an_executable_path_or_an_existing_proxy() {
+        for package in ["OpenAI.Codex_2p2nqsd0c76g0!App", "OpenAI.ChatGPT-Desktop_abc123!ChatGPT", "Claude_abc123!App"] {
+            for running in [false, true] {
+                let processes = if running { vec![Process { id: 3, command: None }] } else { vec![] };
+                let found = Discovery { package: Some(package.into()), registered: true, processes, ..Discovery::default() };
+                let status = found.status(Some(10081), false);
+                assert!(status.installed && status.can_launch && status.store);
+                assert_eq!(status.running, running);
+            }
+        }
     }
 
     #[test]

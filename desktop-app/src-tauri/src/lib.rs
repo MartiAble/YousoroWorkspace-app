@@ -1,6 +1,7 @@
 mod apps;
 mod dns_radar;
 mod launch;
+mod preferences;
 mod radar;
 mod system_proxy;
 mod service;
@@ -18,6 +19,7 @@ struct Connection {
     proxy: Option<system_proxy::Lease>,
     tunnel: Tunnel,
     device_id: Option<String>,
+    started: std::time::Instant,
 }
 
 impl Connection {
@@ -35,6 +37,8 @@ struct Status {
     system_proxy: bool,
     system_proxy_supported: bool,
     proxy_error: Option<String>,
+    uptime_seconds: Option<u64>,
+    device_id: Option<String>,
 }
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T,String> + Send + 'static) -> Result<T,String> {
     tauri::async_runtime::spawn_blocking(f).await.map_err(|_| "Фоновая операция остановлена".to_owned())?
@@ -43,7 +47,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T,String> + Send
 fn status(app: &AppHandle) -> Status {
     let state = app.state::<Runtime>();
     let mut result = Status {
-        port: None, region: None, system_proxy: false, system_proxy_supported: cfg!(windows), proxy_error: None,
+        port: None, region: None, system_proxy: false, system_proxy_supported: cfg!(windows), proxy_error: None, uptime_seconds: None, device_id: None,
     };
     if let Ok(mut guard) = state.0.lock() {
         if let Some(connection) = guard.as_mut() {
@@ -51,6 +55,8 @@ fn status(app: &AppHandle) -> Status {
                 result.port = Some(connection.tunnel.port);
                 result.region = Some(connection.tunnel.region.clone());
                 result.system_proxy = connection.proxy.is_some();
+                result.uptime_seconds = Some(connection.started.elapsed().as_secs());
+                result.device_id = connection.device_id.clone();
             } else {
                 match connection.restore_proxy() {
                     Ok(()) => *guard = None,
@@ -123,7 +129,7 @@ async fn connect_tunnel(app: AppHandle) -> Result<Status,String> { blocking(move
         let executable_dir = executable.parent().ok_or("Нет каталога приложения")?;
         let enrollment = service::bootstrap(&s, &account)?;
         let tunnel = tunnel::start(executable_dir, &path, enrollment.config, region)?;
-        *guard = Some(Connection { tunnel, proxy: None, device_id: enrollment.device_id });
+        *guard = Some(Connection { tunnel, proxy: None, device_id: enrollment.device_id, started: std::time::Instant::now() });
     }
     drop(guard);
     Ok(status(&app))
@@ -274,14 +280,30 @@ async fn installed_desktop_apps(app: AppHandle) -> Result<apps::InstalledApps, S
 }
 
 #[tauri::command]
-async fn launch_desktop_app(app: AppHandle, client: apps::DesktopApp, restart: bool) -> Result<(), String> {
+async fn launch_desktop_app(app: AppHandle, client: apps::DesktopApp, restart: bool) -> Result<Status, String> {
     blocking(move || {
         let state = app.state::<Runtime>();
         let mut guard = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?;
         let connection = guard.as_mut().ok_or("Сначала подключите туннель")?;
         if !connection.tunnel.running() { return Err("Сначала подключите туннель".into()); }
         let port = connection.tunnel.port;
-        apps::launch(client, port, connection.proxy.is_some() && system_proxy::active(port) == Some(true), restart)
+        let already_managed = connection.proxy.is_some();
+        let result = apps::launch(client, port, restart, || {
+            if connection.proxy.is_none() {
+                let data = app.path().app_data_dir().map_err(|_| "Нет каталога данных приложения")?;
+                connection.proxy = Some(system_proxy::Lease::enable(&data, port)?);
+            }
+            if system_proxy::active(port) != Some(true) {
+                return Err("Не удалось направить клиент через системный прокси Windows".into());
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            if !already_managed { connection.restore_proxy()?; }
+            return Err(error);
+        }
+        drop(guard);
+        Ok(status(&app))
     }).await
 }
 #[tauri::command]
@@ -292,11 +314,60 @@ fn open_official(page: String) -> Result<(),String> {
     cmd.arg(url).spawn().map_err(|_| "Не удалось открыть страницу".into()).map(|_| ())
 }
 
+#[derive(Serialize)]
+struct WorkSettings { close_to_tray: bool, autostart: bool }
+
+#[tauri::command]
+async fn work_settings(app: AppHandle) -> Result<WorkSettings, String> {
+    blocking(move || {
+        let data = app.path().app_data_dir().map_err(|_| "Нет каталога настроек")?;
+        Ok(WorkSettings { close_to_tray: preferences::close_to_tray(&data), autostart: preferences::autostart()? })
+    }).await
+}
+
+#[tauri::command]
+async fn set_work_setting(app: AppHandle, setting: String, enabled: bool) -> Result<(), String> {
+    blocking(move || {
+        match setting.as_str() {
+            "autostart" => preferences::set_autostart(enabled),
+            "tray" => {
+                let data = app.path().app_data_dir().map_err(|_| "Нет каталога настроек")?;
+                preferences::set_close_to_tray(&data, enabled).map_err(|_| "Не удалось сохранить настройку окна".into())
+            }
+            _ => Err("Неизвестная настройка".into()),
+        }
+    }).await
+}
+
+#[tauri::command]
+async fn browser_profile_state(app: AppHandle, region: String) -> Result<&'static str, String> {
+    blocking(move || {
+        let data = app.path().app_data_dir().map_err(|_| "Нет каталога профиля")?;
+        let profile = launch::profile_path(&data, &region)?;
+        if !profile.exists() { return Ok("new"); }
+        Ok(if launch::browser_process(&profile)?.is_some() { "open" } else { "ready" })
+    }).await
+}
+
+#[tauri::command]
+fn update_notice(app: AppHandle, version: String, dismiss: bool) -> bool {
+    app.state::<preferences::UpdateNotice>().show(&version, dismiss)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .manage(Runtime::default()).setup(|app| {
+        .manage(Runtime::default())
+        .manage(preferences::UpdateNotice::default())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" && window.app_handle().path().app_data_dir().is_ok_and(|path| preferences::close_to_tray(&path)) {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        }).setup(|app| {
         #[cfg(windows)]
         {
             let data = app.path().app_data_dir()?;
@@ -337,7 +408,7 @@ pub fn run() {
             });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link])
+    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link,work_settings,set_work_setting,browser_profile_state,update_notice])
       .build(tauri::generate_context!()).expect("Workspace setup failed")
       .run(|app,event| match event {
           tauri::RunEvent::Exit => { let _ = disconnect(app.clone()); }

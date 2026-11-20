@@ -1,7 +1,7 @@
 import React from 'react';
 
 export type DesktopClient = 'claude' | 'chatgpt';
-export type DesktopStatus = { installed: boolean; running: boolean; store: boolean; proxy: 'arguments' | 'system' | 'unknown' };
+export type DesktopStatus = { installed: boolean; can_launch: boolean; variant?: string|null; running: boolean; store: boolean; proxy: 'arguments' | 'system' | 'unknown' };
 export type InstalledApps = Record<DesktopClient, DesktopStatus | null>;
 export type Observation = { ip: string; latency_ms: number };
 export type RadarReport = {
@@ -23,7 +23,7 @@ export type RadarReport = {
 export function desktopLabel(status: DesktopStatus) {
   if (!status.installed) return 'Не установлен';
   if (!status.running) return 'Установлен';
-  if (status.proxy === 'arguments') return 'Запущен через туннель';
+  if (status.proxy === 'arguments') return 'Запущен через маршрут';
   if (status.proxy === 'system') return 'Запущен · системный прокси включён';
   return 'Запущен · маршрут не подтверждён';
 }
@@ -91,7 +91,7 @@ export function Radar(props: Props) {
     return app?.running && app.proxy === 'unknown';
   });
   const clientAction = inspectedClient ? (report?.apps[inspectedClient]?.store && !report?.system_proxy
-    ? enableProxy : { label: 'Перезапустить через туннель', run: () => props.client(inspectedClient) }) : undefined;
+    ? enableProxy : { label: 'Перезапустить через маршрут', run: () => props.client(inspectedClient) }) : undefined;
   const systemMismatch = props.windows && report?.timezone_matches === false;
   const browserTimezoneMismatch = !!browser?.actual && browser.actual.timezone !== browser.expected_timezone;
   const browserMismatch = !!browser?.actual && (browserTimezoneMismatch ||

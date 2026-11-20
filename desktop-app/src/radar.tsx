@@ -1,12 +1,10 @@
-import React from 'react';
-
 export type DesktopClient = 'claude' | 'chatgpt';
 export type DesktopStatus = { installed: boolean; can_launch: boolean; variant?: string|null; running: boolean; store: boolean; proxy: 'arguments' | 'system' | 'unknown' };
 export type InstalledApps = Record<DesktopClient, DesktopStatus | null>;
 export type Observation = { ip: string; latency_ms: number };
 export type RadarReport = {
   network: Observation | null; network_error: string | null; matched: boolean | null;
-  geo: { country: string | null; city: string | null; connection: { isp: string | null; asn: number | null } | null } | null;
+  geo: { country: string | null; country_code?: string | null; city: string | null; connection: { isp: string | null; asn: number | null } | null } | null;
   browser: {
     running: boolean | null; expected_timezone: string; expected_language: string;
     actual: { timezone: string; language: string } | null; launch_language: string | null;
@@ -40,158 +38,144 @@ export function usableObservation(value: Observation | null): Observation | null
   return value;
 }
 
-type Tone = 'ok' | 'warning' | 'error';
+export type ScanStage = 'start' | 'network' | 'services' | 'profile' | 'complete';
+type Tone = 'idle' | 'ok' | 'warning' | 'error';
 type Action = { label: string; run: () => void };
-type RadarCard = { title: string; tone: Tone; rows: Array<[string, string]>; action?: Action };
-type ScanStage = 'network' | 'profile' | 'devices';
+type Row = { title: string; text: string; tone: Tone; action?: Action };
 type Props = {
   report: RadarReport | null; network: Observation | null; region: string; stage: ScanStage | null;
-  connected: boolean; busy: boolean; windows: boolean;
-  scan: () => void; connect: () => void; repair: () => void; time: () => void; phone: () => void;
-  browser: () => void; proxy: () => void; client: (client: DesktopClient) => void;
-  copy: (text: string) => void;
+  connected: boolean; busy: boolean;
+  scan: () => void; connect: () => void; repair: () => void; time: () => void;
+  client: (client: DesktopClient) => void; copy: (text: string) => void;
 };
-const unavailable = 'Нет данных';
-const status = (value: boolean | null | undefined, ok: string, fail: string) => value == null ? unavailable : value ? ok : fail;
-const names = { claude: 'Claude Desktop', chatgpt: 'ChatGPT Desktop' };
-const clients = Object.keys(names) as DesktopClient[];
-const labels = { ok: 'OK', warning: 'Внимание', error: 'Ошибка' };
-const phases: Array<[ScanStage, string]> = [['network', 'Маршрут и HTTPS'], ['profile', 'Браузер и DNS'], ['devices', 'Приложения и устройства']];
+const clientNames = { claude: 'Claude', chatgpt: 'ChatGPT' };
+const clients = ['claude','chatgpt'] as const;
+const stages: Record<ScanStage, [number, string]> = {
+  start: [0, 'Начинаем проверку'],
+  network: [20, 'Проверяем подключение и выходной IP…'],
+  services: [50, 'Проверяем доступность сервисов…'],
+  profile: [80, 'Проверяем настройки браузера и приложений…'],
+  complete: [100, 'Проверка завершена'],
+};
+const symbols: Record<Tone, string> = { idle: '·', ok: '✓', warning: '!', error: '×' };
+const headings = {
+  idle: 'Проверка подключения', ok: 'Всё готово к работе',
+  warning: 'Можно работать, есть советы', error: 'Нужно исправить подключение',
+};
+const regions = new Intl.DisplayNames(['ru'], {type:'region', fallback:'none'});
+const cities: Record<string, string> = {
+  Berlin: 'Берлин', Frankfurt: 'Франкфурт', 'Frankfurt am Main': 'Франкфурт-на-Майне',
+  Amsterdam: 'Амстердам', London: 'Лондон', Istanbul: 'Стамбул', 'New York': 'Нью-Йорк',
+  Almaty: 'Алматы', Helsinki: 'Хельсинки', Stockholm: 'Стокгольм', Paris: 'Париж',
+};
 
-function RadarTile({ card, busy }: { card: RadarCard; busy: boolean }) {
-  return <section className="panel radar-tile">
-    <div className="radar-tile-head"><h2>{card.title}</h2><span className="radar-badge" data-tone={card.tone}>{labels[card.tone]}</span></div>
-    <dl>{card.rows.map(([label, value]) => <React.Fragment key={label}><dt>{label}</dt><dd>{value}</dd></React.Fragment>)}</dl>
-    {card.action && <button className="radar-action" disabled={busy} onClick={card.action.run}>{card.action.label}</button>}
-  </section>;
+function locationLabel(geo: RadarReport['geo'] | undefined, region: string) {
+  const code = geo?.country_code;
+  const country = code && /^[A-Z]{2}$/.test(code) ? regions.of(code) : '';
+  const city = geo?.city && (cities[geo.city] ?? geo.city);
+  return [country || region || geo?.country, city].filter(Boolean).join(', ');
 }
 
 export function Radar(props: Props) {
   const { report, busy, connected, stage } = props;
-  const network = usableObservation(report ? report.network : props.network);
-  const passed = report ? Math.max(0, Math.min(report.ready, network ? report.total : report.total - 2)) : 0;
-  const score = report?.total ? Math.round(100 * passed / report.total) : 0;
-  const scoreTone = !report ? 'idle' : score === 100 ? 'ok' : score >= 70 ? 'warning' : 'error';
-  const headline = !report ? 'Проверка среды' : score === 100 ? 'Контур чист, можно работать' : score >= 70 ? 'Есть рекомендации' : 'Требуется действие';
-  const latencyTone = !network ? 'warning' : network.latency_ms < 250 ? 'ok' : network.latency_ms <= 600 ? 'warning' : 'error';
-  const location = [report?.geo?.country, report?.geo?.city].filter(Boolean).join(', ') || props.region;
+  const network = connected ? usableObservation(report ? report.network : props.network) : null;
+  const location = locationLabel(report?.geo, props.region);
   const browser = report?.browser;
-  const reconnect = { label: connected ? 'Переподключить туннель' : 'Подключить туннель', run: props.connect };
-  const repair = { label: 'Починить настройки профиля', run: props.repair };
-  const openBrowser = { label: 'Открыть рабочий браузер', run: props.browser };
-  const time = { label: 'Открыть настройки времени ОС', run: props.time };
-  const phone = { label: 'Открыть проверку смартфона', run: props.phone };
-  const retry = { label: 'Повторить проверку', run: props.scan };
-  const enableProxy = { label: 'Включить системный прокси', run: props.proxy };
-  const matched = network ? report?.matched : null;
-  const routeIssue = !!report && (!network || matched !== true);
-  const profileIssue = !!report && (browser?.geolocation_blocked !== true || browser?.webrtc_protected !== true);
-  const inspectedClient = clients.find(key => {
-    const app = report?.apps[key];
-    return app?.running && app.proxy === 'unknown';
-  });
-  const clientAction = inspectedClient ? (report?.apps[inspectedClient]?.store && !report?.system_proxy
-    ? enableProxy : { label: 'Перезапустить через маршрут', run: () => props.client(inspectedClient) }) : undefined;
-  const systemMismatch = props.windows && report?.timezone_matches === false;
-  const browserTimezoneMismatch = !!browser?.actual && browser.actual.timezone !== browser.expected_timezone;
-  const browserMismatch = !!browser?.actual && (browserTimezoneMismatch ||
-    browser.actual.language.toLowerCase() !== browser.expected_language.toLowerCase());
-  const https = report?.https;
-  const httpsIssue = !!https && (!https.claude || !https.chatgpt);
-  const dns = report?.dns;
-  const dnsText = dns?.status === 'distinct' ? 'Резолверы различаются' : dns?.status === 'overlap' ? 'Есть общие резолверы' : dns ? 'Проба недоступна' : 'Ожидает проверки';
-  const cards: RadarCard[] = [
+  const service = report?.https;
+  const mismatch = report?.timezone_matches === false;
+  const browserMismatch = !!browser?.actual && browser.actual.timezone !== browser.expected_timezone;
+  const missingProtection = browser?.geolocation_blocked === false || browser?.webrtc_protected === false;
+  const inspected = clients.find(key => report?.apps[key]?.running && report.apps[key]?.proxy === 'unknown');
+  const reconnect = { label: connected ? 'Переподключить' : 'Подключить маршрут', run:props.connect };
+  const timeAction = { label:'Открыть настройки времени', run:props.time };
+  const serviceMiss = !!service && (!service.claude || !service.chatgpt);
+  const critical = !connected || !!report && (!network || serviceMiss);
+  const advisory = !!report && (report.matched !== true || !service || missingProtection || mismatch || browserMismatch || !!inspected);
+  const verdict: Tone = critical ? 'error' : !report ? 'idle' : advisory ? 'warning' : 'ok';
+  const rows: Row[] = [
     {
-      title: 'Маршрут и выходной узел',
-      tone: report && (!network || matched === false) ? 'error' : matched === true ? 'ok' : 'warning',
-      rows: [
-        ['Внешний IPv4', network?.ip || (report?.network_error ? 'Публичный IPv4 недоступен' : unavailable)],
-        ['Страна и город', location || unavailable],
-        ['Провайдер / ASN', [report?.geo?.connection?.isp, report?.geo?.connection?.asn && 'AS' + report.geo.connection.asn].filter(Boolean).join(' · ') || unavailable],
-        ['Сверка с узлом', status(matched, 'Подтверждено', 'Адрес отличается от узла')],
-      ],
-      action: routeIssue || !connected ? reconnect : undefined,
+      title:'Подключение и IP',
+      tone: !connected || report && !network ? 'error' : report && report.matched !== true ? 'warning' : network ? 'ok' : 'idle',
+      text: !connected ? 'Рабочий маршрут отключён' : !network ? report ? 'Не удалось получить внешний IP' : 'Проверка внешнего IP ещё не завершена' :
+        report?.matched === false ? 'Внешний IP отличается от адреса выбранного узла' : report?.matched === null ?
+          'Внешний IP получен. Сверка с выбранным узлом недоступна' :
+          'Маршрут активен' + (location ? ' · ' + location : '') + ' (' + network.ip + ')',
+      action: !connected || report && (!network || report.matched === false) ? reconnect : undefined,
     },
     {
-      title: 'Чистота сети',
-      tone: httpsIssue ? 'error' : report && !profileIssue && dns?.status === 'distinct' && https ? 'ok' : 'warning',
-      rows: [
-        ['DNS', dnsText + (dns ? ' · SOCKS5 ' + dns.tunnel_resolvers + ' / ОС ' + dns.system_resolvers : '')],
-        ['WebRTC', status(browser?.webrtc_protected, 'Ограничен · disable_non_proxied_udp', 'Ограничение выключено')],
-        ['Геолокация', status(browser?.geolocation_blocked, 'Заблокирована в профиле', 'Блокировка выключена')],
-        ['HTTPS через туннель', https ? 'Claude ' + (https.claude ? '✓' : '—') + ' · ChatGPT ' + (https.chatgpt ? '✓' : '—') : unavailable],
-      ],
-      action: profileIssue ? repair : httpsIssue ? reconnect : undefined,
+      title:'Доступность сервисов',
+      tone: serviceMiss ? 'error' : service ? 'ok' : 'idle',
+      text: !service ? 'Доступность ещё не проверена' : !service.claude && !service.chatgpt ? 'Нет ответа от Claude и ChatGPT' :
+        !service.claude ? 'Нет ответа от Claude. ChatGPT отвечает' : !service.chatgpt ? 'Нет ответа от ChatGPT. Claude отвечает' : 'Claude и ChatGPT отвечают',
+      action: serviceMiss ? reconnect : undefined,
     },
     {
-      title: 'Среда и локализация',
-      tone: systemMismatch || browserMismatch || !browser?.actual ? 'warning' : 'ok',
-      rows: [
-        ['Часовой пояс узла', browser?.expected_timezone || unavailable],
-        ['Часовой пояс ОС', report?.timezone || unavailable],
-        ['Рабочий браузер', browser?.actual?.timezone || unavailable],
-        ['Язык / флаг запуска', [browser?.actual?.language || browser?.expected_language, browser?.launch_language && '--lang=' + browser.launch_language].filter(Boolean).join(' · ') || unavailable],
-        ['Системный прокси', props.windows ? status(report?.system_proxy, 'Указывает на туннель', 'Выключен') : 'Не применяется'],
-      ],
-      action: systemMismatch ? time : undefined,
+      title:'Защита браузера',
+      tone: missingProtection ? 'warning' : browser ? 'ok' : 'idle',
+      text: missingProtection ? 'Параметры защиты рабочего профиля требуют настройки' :
+        browser?.running === false ? 'Рабочий браузер готов к запуску' :
+        browser?.geolocation_blocked && browser.webrtc_protected ? 'Доступ к геолокации и локальному адресу ограничен' : 'Защита проверяется в рабочем браузере',
+      action: missingProtection && !browser?.running ? {label:'Восстановить защиту',run:props.repair} : undefined,
     },
     {
-      title: 'Приложения и устройства',
-      tone: report?.devices?.current_pc === false ? 'error' : report?.devices?.current_pc && report.devices.mobile && browser?.running && !clientAction ? 'ok' : 'warning',
-      rows: [
-        ['Рабочий браузер', status(browser?.running, 'Открыт', 'Закрыт')],
-        ...clients.map((key): [string, string] => {
-          const app = report?.apps[key];
-          return [names[key], app ? desktopLabel(app) : unavailable];
-        }),
-        ['Слоты аккаунта', report?.devices ? report.devices.used + ' из ' + report.devices.limit + ' · ПК ' + report.devices.desktop + ' · телефон ' + report.devices.mobile : unavailable],
-        ['Текущий ПК', status(report?.devices?.current_pc, 'Привязка активна', 'Привязка отсутствует')],
-      ],
-      action: clientAction,
+      title:'Время на компьютере',
+      tone: mismatch || browserMismatch ? 'warning' : report?.timezone_matches ? 'ok' : 'idle',
+      text: mismatch ? (report?.timezone === 'Turkey Standard Time' ? 'Время Windows (Турция) отличается от выбранного региона' : 'Время компьютера отличается от выбранного региона') :
+        browserMismatch ? 'Перезапустите рабочий браузер после смены часового пояса' : report?.timezone_matches ? 'Совпадает с выбранным регионом' : 'Сверка времени ещё не выполнена',
+      action: mismatch || browserMismatch ? timeAction : undefined,
+    },
+    {
+      title:'Приложения на ПК',
+      tone: inspected ? 'warning' : report ? 'ok' : 'idle',
+      text: inspected ? clientNames[inspected] + ' открыт. Рабочий маршрут не подтверждён' :
+        report ? clients.some(key => report.apps[key]?.running) ? 'Запущенные клиенты используют рабочий маршрут' : 'Лаунчер готов открыть рабочие приложения' : 'Состояние приложений ещё не проверено',
+      action: inspected && report?.apps[inspected]?.can_launch ? {label:'Перезапустить через маршрут',run:()=>props.client(inspected)} : undefined,
     },
   ];
-  const recommendations: Array<[string, Action]> = [];
-  if (routeIssue || httpsIssue) recommendations.push(['Проверьте рабочий маршрут через выделенный узел.', reconnect]);
-  if (profileIssue) recommendations.push([browser?.running ? 'Закройте рабочий браузер перед исправлением профиля.' : 'Восстановите блокировку геолокации и настройки WebRTC.', repair]);
-  if (systemMismatch) recommendations.push(['Сверьте часовой пояс Windows с выбранным узлом.', time]);
-  if (clientAction) recommendations.push(['Подключите запущенный клиент к рабочему маршруту.', clientAction]);
-  if (browser?.running === false) recommendations.push(['Откройте рабочий браузер для проверки языка и часового пояса.', openBrowser]);
-  if (browser?.running === true && browserTimezoneMismatch) recommendations.push(['Перезапустите рабочий браузер после смены часового пояса ОС.', time]);
-  if (report && !report.devices?.mobile) recommendations.push(['Проверьте профиль на смартфоне.', phone]);
-  if (report && dns?.status !== 'distinct') recommendations.push(['Повторите сравнение системных и туннельных DNS-резолверов.', retry]);
-  if (report?.devices?.current_pc !== true) recommendations.push(['Повторите сверку текущего ПК с активными слотами.', retry]);
-
-  const reportText = () => {
-    const lines = cards.flatMap(card => ['', card.title, ...card.rows.map(([key, value]) => key + ': ' + value)]);
-    return ['Yousoro Workspace · Радар подключения', 'Готовность: ' + score + '%',
-      'Задержка HTTPS: ' + (network ? network.latency_ms + ' мс' : unavailable), ...lines].join('\n');
-  };
-  const phase = phases.findIndex(([key]) => key === stage);
+  const details: Array<[string,string]> = report ? [
+    ['Провайдер / ASN', [report.geo?.connection?.isp, report.geo?.connection?.asn && 'AS' + report.geo.connection.asn].filter(Boolean).join(' · ') || 'Нет данных'],
+    ['DNS-проба', report.dns ? (report.dns.status === 'distinct' ? 'Разные резолверы' : report.dns.status === 'overlap' ? 'Есть совпадения' : 'Нет ответа от сервиса проверки') +
+      ' · SOCKS5 ' + report.dns.tunnel_resolvers + ' / ОС ' + report.dns.system_resolvers : 'Не запрашивалась'],
+    ['WebRTC', browser?.webrtc_protected === true ? 'disable_non_proxied_udp' : browser?.webrtc_protected === false ? 'Ограничение выключено' : 'Нет данных'],
+    ['Язык браузера', [browser?.actual?.language || browser?.expected_language, browser?.launch_language && '--lang=' + browser.launch_language].filter(Boolean).join(' · ') || 'Нет данных'],
+    ['Часовые пояса', [browser?.expected_timezone, report.timezone, browser?.actual?.timezone].filter(Boolean).join(' / ') || 'Нет данных'],
+    ['Слоты устройств', report.devices ? report.devices.used + ' из ' + report.devices.limit + ' · ПК ' + report.devices.desktop + ' · телефон ' + report.devices.mobile : 'Нет данных'],
+  ] : [];
+  function copyReport() {
+    props.copy(['Yousoro Workspace · Радар подключения', headings[verdict], ...rows.map(({title,text}) => title + ': ' + text),
+      ...details.map(([name,value]) => name + ': ' + value)].join('\n'));
+  }
+  const phase = stage ? stages[stage] : null;
   return <div className="radar-dashboard">
-    <section className="panel radar-hero" data-tone={scoreTone} aria-busy={!!stage}>
-      <div className="radar-health">
-        <div className="radar-gauge" aria-label={report ? 'Готовность ' + score + '%' : 'Проверка не запускалась'}>
-          <svg viewBox="0 0 80 80" aria-hidden="true"><circle cx="40" cy="40" r="34" pathLength="100"/><circle className="radar-gauge-fill" cx="40" cy="40" r="34" pathLength="100" strokeDasharray={score + ' 100'}/></svg>
-          <strong>{report ? score + '%' : '—'}</strong>
+    <section className="panel radar-verdict" data-tone={verdict} aria-busy={!!stage && stage !== 'complete'}>
+      <div className="radar-intro">
+        <span className="radar-symbol" data-tone={verdict} aria-hidden="true">{symbols[verdict]}</span>
+        <div><h2>{headings[verdict]}</h2>
+          <div className="radar-location">
+            {location && <span>{location}</span>}
+            {network && <button className="radar-copy-ip" aria-label={'Скопировать IP ' + network.ip} onClick={()=>props.copy(network.ip)}>{network.ip} <span aria-hidden="true">⧉</span></button>}
+            {network && <span className="chip">Отклик {network.latency_ms} мс</span>}
+          </div>
         </div>
-        <div><small>Готовность контура</small><h2>{headline}</h2>{report && <small>{passed} из {report.total} проверок</small>}</div>
       </div>
-      <div className="radar-endpoint">
-        <small>{location || 'Выходной узел'}</small>
-        {network ? <button className="radar-ip" aria-label={'Скопировать IPv4 ' + network.ip} onClick={() => props.copy(network.ip)}>{network.ip}<span aria-hidden="true">⧉</span></button> : <strong>IPv4 недоступен</strong>}
-        <span className="radar-badge" data-tone={latencyTone}>{network ? network.latency_ms + ' мс' : 'Задержка недоступна'}</span>
+      <div className="radar-controls">
+        <button className="primary" disabled={busy} onClick={connected ? props.scan : props.connect}>{stage && stage !== 'complete' ? 'Проверяем…' : connected ? report ? 'Проверить снова' : 'Проверить всё' : 'Подключить маршрут'}</button>
+        <button disabled={!report || busy} onClick={copyReport}>Отчёт для поддержки</button>
       </div>
-      <div className="radar-hero-actions">
-        <button className="primary" disabled={busy} onClick={connected ? props.scan : props.connect}>{stage ? 'Проверяем…' : connected ? 'Проверить всё' : 'Подключить туннель'}</button>
-        <button disabled={!report || !!stage} onClick={() => props.copy(reportText())}>Отчёт для поддержки</button>
-      </div>
-      {stage && <ol className="radar-phases" aria-label="Ход проверки">{phases.map(([key, label], index) =>
-        <li key={key} data-done={index < phase} aria-current={key === stage ? 'step' : undefined}>{label}</li>)}</ol>}
+      {phase && <div className="radar-progress" role="status">
+        <div className="radar-track" data-percent={phase[0]} role="progressbar" aria-label="Ход проверки подключения" aria-valuemin={0} aria-valuemax={100} aria-valuenow={phase[0]}><span/></div>
+        <p>{phase[0]}% — {phase[1]}</p>
+      </div>}
     </section>
-    <div className="radar-grid">{cards.map(card => <RadarTile key={card.title} card={card} busy={busy}/>)}</div>
-    {report && score < 100 && <section className="panel radar-recommendations"><h2>Что улучшить</h2><ul>
-      {(recommendations.length ? recommendations : [['Уточните результаты повторной проверкой.', retry] as [string, Action]]).slice(0, 3).map(([label, action]) => <li key={label}><span>{label}</span><button disabled={busy} onClick={action.run}>{action.label}</button></li>)}
-    </ul></section>}
-    <details className="radar-notes"><summary>Как проходит проверка</summary><p>Для GeoIP ipwho.is получает внешний IP узла. DNS-проба сравнивает резолверы через bash.ws. HTTPS-проверка измеряет доступность сервиса по рабочему маршруту.</p></details>
+    <ul className="panel radar-checks" aria-label="Результаты проверки">
+      {rows.map(row=><li key={row.title}>
+        <span className="radar-symbol" data-tone={row.tone} aria-label={{idle:'Ожидание',ok:'Готово',warning:'Совет',error:'Ошибка'}[row.tone]} role="img">{symbols[row.tone]}</span>
+        <div><h3>{row.title}</h3><p>{row.text}</p></div>
+        {row.action && <button disabled={busy} onClick={row.action.run}>{row.action.label}</button>}
+      </li>)}
+    </ul>
+    {report && <details className="panel radar-details"><summary>Технические подробности</summary><dl>
+      {details.map(([name,value])=><div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}
+    </dl></details>}
   </div>;
 }

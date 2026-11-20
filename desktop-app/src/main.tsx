@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Radar, desktopLabel, usableObservation, type DesktopClient, type InstalledApps, type Observation, type RadarReport } from './radar';
+import { Radar, desktopLabel, usableObservation, type DesktopClient, type InstalledApps, type Observation, type RadarReport, type ScanStage } from './radar';
 import { UpdateBanner, UpdateSettings, useAppUpdates } from './updates';
 import './style.css';
 
@@ -24,7 +24,7 @@ function App() {
   const [observed,setObserved] = useState<RadarReport|null>(null);
   const [outbound,setOutbound] = useState<Observation|null>(null);
   const networkRevision = useRef(0);
-  const [radarStage,setRadarStage] = useState<'network'|'profile'|'devices'|null>(null);
+  const [radarStage,setRadarStage] = useState<ScanStage|null>(null);
   const [tab,setTab] = useState(0);
   const [error,setError] = useState('');
   const [working,setBusy] = useState(false);
@@ -46,7 +46,7 @@ function App() {
     const openRadar = () => { void invoke<boolean>('take_radar_link').then(requested => { if (requested) setTab(1); }).catch(() => {}); };
     const radarLink = listen('open-radar', openRadar);
     void radarLink.then(openRadar).catch(() => {});
-    const progress = listen<'network'|'profile'|'devices'>('radar-progress', event => setRadarStage(event.payload));
+    const progress = listen<'network'|'services'|'profile'>('radar-progress', event => setRadarStage(event.payload));
     return () => { void radarLink.then(unlisten => unlisten()).catch(() => {}); void progress.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
   useEffect(() => { setResetRegion(null); setCopied(''); }, [profileRegion, tab]);
@@ -139,14 +139,20 @@ function App() {
   });
   async function readRadar() {
     networkRevision.current += 1;
-    setRadarStage('network');
+    setRadarStage('start');
     try {
       const result = await invoke<RadarReport>('run_system_radar',{lookupGeo:true,checkDns:true});
       networkRevision.current += 1;
       setObserved(result);
       setOutbound(usableObservation(result.network));
-    } finally { setRadarStage(null); }
+      setRadarStage('complete');
+    } catch (error) { setRadarStage(null); throw error; }
   }
+  useEffect(() => {
+    if (radarStage !== 'complete') return;
+    const timer = window.setTimeout(() => setRadarStage(null), 1400);
+    return () => window.clearTimeout(timer);
+  }, [radarStage]);
   const scan = () => perform(readRadar);
   const connectRadar = () => perform(async () => {
     if (connection.port) setConnection(await invoke<Connection>('disconnect'));
@@ -160,10 +166,6 @@ function App() {
   });
   const routeRadarClient = (client:DesktopClient) => perform(async () => {
     setConnection(await invoke<Connection>('launch_desktop_app',{client,restart:true}));
-    await readRadar();
-  });
-  const enableRadarProxy = () => perform(async () => {
-    setConnection(await invoke<Connection>('set_system_proxy',{enabled:true}));
     await readRadar();
   });
   const endpoint = connection.port ? '127.0.0.1:' + connection.port : '';
@@ -253,10 +255,9 @@ function App() {
         </>}
         {tab===1 && <Radar
           report={observed} network={outbound} connected={!!connection.port} busy={busy} stage={radarStage}
-          region={regions.find(region=>region.id===profileRegion)?.name || ''} windows={!!connection.system_proxy_supported}
+          region={regions.find(region=>region.id===profileRegion)?.name || ''}
           scan={()=>void scan()} connect={()=>void connectRadar()} repair={()=>void repairRadar()}
-          time={()=>void perform(()=>invoke('open_time_settings'))} phone={()=>void official('phone')}
-          browser={()=>void open('workspace')} proxy={()=>void enableRadarProxy()}
+          time={()=>void perform(()=>invoke('open_time_settings'))}
           client={client=>void routeRadarClient(client)} copy={text=>void copy(text)}
         />}
         {tab===2 && <>

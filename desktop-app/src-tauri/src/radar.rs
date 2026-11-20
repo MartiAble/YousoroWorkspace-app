@@ -81,6 +81,7 @@ pub fn observe_tunnel(port: u16) -> Result<Observation, String> {
 #[derive(Serialize, Deserialize)]
 struct Geo {
     country: Option<String>,
+    country_code: Option<String>,
     city: Option<String>,
     connection: Option<Provider>,
 }
@@ -296,12 +297,14 @@ pub fn report(
     let session = service::Session::restore().ok();
     let (network, network_error, matched, geo, https) = match client(port) {
         Ok(client) => {
-            let (result, claude, chatgpt) = std::thread::scope(|scope| {
+            let observation = observe(&client);
+            let gateway = session.as_ref().and_then(|session| tunnel_check(&client, session));
+            let result = reconcile(observation, gateway);
+            progress("services");
+            let (claude, chatgpt) = std::thread::scope(|scope| {
                 let claude = scope.spawn(|| https_available(&client, "https://claude.ai/"));
                 let chatgpt = scope.spawn(|| https_available(&client, "https://chatgpt.com/"));
-                let observation = observe(&client);
-                let gateway = session.as_ref().and_then(|session| tunnel_check(&client, session));
-                (reconcile(observation, gateway), claude.join().unwrap_or(false), chatgpt.join().unwrap_or(false))
+                (claude.join().unwrap_or(false), chatgpt.join().unwrap_or(false))
             });
             let https = Some(HttpsTargets { claude, chatgpt });
             match result {
@@ -336,7 +339,6 @@ pub fn report(
     let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected };
     let dns = check_dns.then(|| dns_radar::check(port));
 
-    progress("devices");
     let system_proxy = system_proxy::active(port);
     let apps = apps::installed_apps(Some(port), system_proxy == Some(true));
 

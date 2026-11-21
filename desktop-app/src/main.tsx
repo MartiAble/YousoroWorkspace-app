@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Radar, desktopLabel, usableObservation, type DesktopClient, type InstalledApps, type Observation, type RadarReport, type ScanStage } from './radar';
+import { Radar, desktopLabel, usableObservation, type DesktopClient, type InstalledApps, type Observation, type BrowserProbeReport, type RadarReport, type ScanStage } from './radar';
 import { UpdateBanner, UpdateSettings, useAppUpdates } from './updates';
 import './style.css';
 
@@ -22,6 +22,8 @@ function App() {
   const [regions,setRegions] = useState<Region[]>([]);
   const [connection,setConnection] = useState<Connection>(empty);
   const [observed,setObserved] = useState<RadarReport|null>(null);
+  const [browserReport,setBrowserReport] = useState<BrowserProbeReport|null>(null);
+  const [useStun,setUseStun] = useState(false);
   const [outbound,setOutbound] = useState<Observation|null>(null);
   const networkRevision = useRef(0);
   const [radarStage,setRadarStage] = useState<ScanStage|null>(null);
@@ -96,6 +98,7 @@ function App() {
   useEffect(() => {
     setOutbound(null);
     setObserved(null);
+    setBrowserReport(null);
     if (!native || !connection.port) return;
     let active = true;
     const refresh = () => {
@@ -154,6 +157,12 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [radarStage]);
   const scan = () => perform(readRadar);
+  const scanBrowser = () => perform(async () => {
+    setBrowserReport(null);
+    if (!observed) await readRadar();
+    const report = await invoke<BrowserProbeReport>('run_browser_probe', { stun: useStun });
+    setBrowserReport(report);
+  });
   const connectRadar = () => perform(async () => {
     if (connection.port) setConnection(await invoke<Connection>('disconnect'));
     setConnection(await invoke<Connection>('connect_tunnel'));
@@ -254,7 +263,7 @@ function App() {
           <button className="cli-link" onClick={()=>changeTab(2)}><Icon name="terminal"/><span>Терминал, Cursor или Codex CLI</span><strong>Настроить окружение</strong><Icon name="arrow"/></button>
         </>}
         {tab===1 && <Radar
-          report={observed} network={outbound} connected={!!connection.port} busy={busy} stage={radarStage}
+          report={observed} browserReport={browserReport} stun={useStun} setStun={setUseStun} scanBrowser={()=>void scanBrowser()} network={outbound} connected={!!connection.port} busy={busy} stage={radarStage}
           region={regions.find(region=>region.id===profileRegion)?.name || ''}
           scan={()=>void scan()} connect={()=>void connectRadar()} repair={()=>void repairRadar()}
           time={()=>void perform(()=>invoke('open_time_settings'))}
@@ -289,11 +298,11 @@ function App() {
             <h2>Параметры работы</h2>
             <label className="toggle-row"><span>Автозапуск при входе в ОС</span><input type="checkbox" role="switch" checked={!!settings?.autostart} disabled={busy || !settings} onChange={e=>void changeSetting('autostart',e.target.checked)}/></label>
             <label className="toggle-row"><span>Сворачивать в трей при закрытии</span><input type="checkbox" role="switch" checked={!!settings?.close_to_tray} disabled={busy || !settings} onChange={e=>void changeSetting('tray',e.target.checked)}/></label>
-            {connection.system_proxy_supported && <label className="toggle-row"><span>Системный прокси для Store-клиентов</span><input type="checkbox" role="switch" checked={!!connection.system_proxy} disabled={busy} onChange={e=>{
+            {connection.system_proxy_supported && <label className="toggle-row"><span>Точечный маршрут для Store-приложений</span><input type="checkbox" role="switch" checked={!!connection.system_proxy} disabled={busy} onChange={e=>{
               const enabled=e.target.checked; void perform(async()=>{ if (enabled) await ensureRoute(); setConnection(await invoke<Connection>('set_system_proxy',{enabled})); });
             }}/></label>}
             <label className="toggle-row"><span>Повышенный контраст</span><input type="checkbox" role="switch" checked={contrast} onChange={e=>{setContrast(e.target.checked);localStorage.setItem('workspace.contrast',e.target.checked?'on':'off');}}/></label>
-            <div className="actions"><button onClick={()=>void copy(['Workspace ' + updates.version, 'Регион: ' + regionName, 'Маршрут: ' + (connection.port?'активен':'отключён'), 'Задержка: ' + (outbound ? outbound.latency_ms + ' мс' : 'недоступна'), 'Системный прокси: ' + (connection.system_proxy?'включён':'выключен')].join('\n'),'log')}>{copied==='log'?'Скопировано ✓':'Скопировать лог'}</button></div>
+            <div className="actions"><button onClick={()=>void copy(['Workspace ' + updates.version, 'Регион: ' + regionName, 'Маршрут: ' + (connection.port?'активен':'отключён'), 'Задержка: ' + (outbound ? outbound.latency_ms + ' мс' : 'недоступна'), 'Точечный маршрут Store: ' + (connection.system_proxy?'включён':'выключен')].join('\n'),'log')}>{copied==='log'?'Скопировано ✓':'Скопировать лог'}</button></div>
           </section>
         </div>}
       </main>

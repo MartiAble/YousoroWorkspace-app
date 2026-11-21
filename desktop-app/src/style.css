@@ -181,3 +181,5 @@ button.quiet{border-color:transparent;background:transparent;color:var(--muted)}
 .radar-details dd{margin:0;overflow-wrap:anywhere}
 @media(max-width:850px){.radar-verdict{grid-template-columns:1fr}.radar-controls{justify-content:flex-start}}
 @media(prefers-reduced-motion:reduce){.radar-track>span{transition:none}.radar-track>span::after{animation:none!important}}
+
+.radar-stun{display:flex;align-items:flex-start;gap:8px;margin-block:10px;color:var(--muted)}

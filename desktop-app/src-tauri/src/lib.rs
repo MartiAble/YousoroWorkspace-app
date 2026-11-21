@@ -148,14 +148,65 @@ async fn run_system_radar(app: AppHandle, lookup_geo: bool, check_dns: Option<bo
         let region = route.region.ok_or("Регион не определён")?;
         let data = app.path().app_data_dir().map_err(|_| "Нет каталога данных приложения")?;
         let state = app.state::<Runtime>();
-        let (device_id, environment) = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?.as_ref()
+        let (device_id, environment, pac_active) = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?.as_ref()
             .filter(|active| active.tunnel.port == port)
-            .map(|active| (active.device_id.clone(), active.environment.clone()))
+            .map(|active| (active.device_id.clone(), active.environment.clone(), system_proxy::active(active.proxy.as_ref())))
             .ok_or("Туннель изменился во время диагностики")?;
-        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref(), environment.as_ref(),
+        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref(), environment.as_ref(), pac_active,
             |stage| { let _ = app.emit("radar-progress", stage); });
         if status(&app).port != Some(port) { return Err("Туннель изменился во время диагностики".into()); }
         Ok(report)
+    }).await
+}
+
+#[tauri::command]
+async fn run_browser_probe(app: AppHandle, stun: bool) -> Result<Value, String> {
+    blocking(move || {
+        let state = app.state::<Runtime>();
+        let (port, region, environment) = {
+            let guard = state.0.lock().map_err(|_| "Ошибка состояния маршрута")?;
+            let connection = guard.as_ref().ok_or("Сначала подключите маршрут")?;
+            (connection.tunnel.port, connection.tunnel.region.clone(), connection.environment.clone())
+        };
+        let session = service::Session::restore()?;
+        let client = service::client()?;
+        #[derive(serde::Deserialize)]
+        struct Started { token: String, diagnostics_origin: String }
+        let started: Started = service::checked(session.authorize(client.post(
+            format!("{}/api/radar-probe/start", service::ORIGIN)
+        )).send())?.json().map_err(|_| "Сервер не выдал код проверки")?;
+        if started.token.len() != 48 || !started.token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("Сервер выдал некорректный код проверки".into());
+        }
+        let mut url = reqwest::Url::parse(&format!("{}/radar-probe", service::ORIGIN))
+            .map_err(|_| "Некорректный адрес проверки")?;
+        let mut fragment = reqwest::Url::parse("https://example.invalid/").map_err(|_| "Некорректный адрес")?;
+        {
+            let mut args = fragment.query_pairs_mut();
+            args.append_pair("token", &started.token).append_pair("check", &started.diagnostics_origin);
+            if let Some(environment) = &environment { args.append_pair("timezone", &environment.timezone); }
+            if stun { args.append_pair("stun", "1"); }
+        }
+        url.set_fragment(fragment.query());
+        {
+            let _profile = state.1.lock().map_err(|_| "Ошибка состояния профиля")?;
+            if status(&app).port != Some(port) { return Err("Маршрут изменился во время проверки".into()); }
+            let data = app.path().app_data_dir().map_err(|_| "Не удалось открыть каталог приложения")?;
+            let profile = launch::profile_path(&data, &region)?;
+            launch::open_probe(&profile, port, environment.as_ref(), url.as_str())?;
+        }
+        let wait_until = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        let endpoint = format!("{}/api/radar-probe/result", service::ORIGIN);
+        while std::time::Instant::now() < wait_until {
+            if status(&app).port != Some(port) { return Err("Маршрут изменился во время проверки".into()); }
+            let body: Value = service::checked(session.authorize(client.post(&endpoint))
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&json!({ "token": &started.token })).send())?
+                .json().map_err(|_| "Не удалось прочитать отчёт браузера")?;
+            if !body["report"].is_null() { return Ok(body["report"].clone()); }
+            std::thread::sleep(std::time::Duration::from_millis(800));
+        }
+        Err("Браузер не передал результат проверки. Проверьте, открылась ли вкладка Workspace.".into())
     }).await
 }
 
@@ -169,7 +220,14 @@ async fn set_system_proxy(app: AppHandle, enabled: bool) -> Result<Status, Strin
             if !connection.tunnel.running() { return Err("Сначала подключите туннель".into()); }
             if connection.proxy.is_none() {
                 let data = app.path().app_data_dir().map_err(|_| "Нет каталога данных приложения")?;
-                connection.proxy = Some(system_proxy::Lease::enable(&data, connection.tunnel.port)?);
+                #[derive(serde::Deserialize)]
+                struct Routing { version: u32, domains: Vec<String> }
+                let session = service::Session::restore()?;
+                let rules: Routing = service::checked(session.authorize(service::client()?.get(
+                    format!("{}/api/desktop/routing", service::ORIGIN)
+                )).send())?.json().map_err(|_| "Не удалось получить список доменов Workspace")?;
+                if rules.version == 0 { return Err("Список маршрутов Workspace не готов".into()); }
+                connection.proxy = Some(system_proxy::Lease::enable(&data, connection.tunnel.port, &rules.domains)?);
             }
         } else {
             connection.restore_proxy()?;
@@ -279,7 +337,7 @@ struct WindowsInstance { _lock: std::fs::File }
 async fn installed_desktop_apps(app: AppHandle) -> Result<apps::InstalledApps, String> {
     blocking(move || {
         let route = status(&app);
-        Ok(apps::installed_apps(route.port, route.port.and_then(system_proxy::active) == Some(true)))
+        Ok(apps::installed_apps(route.port, route.system_proxy))
     }).await
 }
 
@@ -291,21 +349,7 @@ async fn launch_desktop_app(app: AppHandle, client: apps::DesktopApp, restart: b
         let connection = guard.as_mut().ok_or("Сначала подключите туннель")?;
         if !connection.tunnel.running() { return Err("Сначала подключите туннель".into()); }
         let port = connection.tunnel.port;
-        let already_managed = connection.proxy.is_some();
-        let result = apps::launch(client, port, restart, || {
-            if connection.proxy.is_none() {
-                let data = app.path().app_data_dir().map_err(|_| "Нет каталога данных приложения")?;
-                connection.proxy = Some(system_proxy::Lease::enable(&data, port)?);
-            }
-            if system_proxy::active(port) != Some(true) {
-                return Err("Не удалось направить клиент через системный прокси Windows".into());
-            }
-            Ok(())
-        });
-        if let Err(error) = result {
-            if !already_managed { connection.restore_proxy()?; }
-            return Err(error);
-        }
+        apps::launch(client, port, restart, system_proxy::active(connection.proxy.as_ref()))?;
         drop(guard);
         Ok(status(&app))
     }).await
@@ -412,7 +456,7 @@ pub fn run() {
             });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link,work_settings,set_work_setting,browser_profile_state,update_notice])
+    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,run_browser_probe,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link,work_settings,set_work_setting,browser_profile_state,update_notice])
       .build(tauri::generate_context!()).expect("Workspace setup failed")
       .run(|app,event| match event {
           tauri::RunEvent::Exit => { let _ = disconnect(app.clone()); }

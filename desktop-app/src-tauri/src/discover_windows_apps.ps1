@@ -41,7 +41,25 @@ if ($application) {
             $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and
             ($_.ProcessName -in @($name, 'Codex'))
         }
-        $list += @($packageProcesses | ForEach-Object { @{ id = $_.Id; path = $_.Path; command = $null } })
+        $list += @($packageProcesses | ForEach-Object {
+            $cmd = Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -ErrorAction SilentlyContinue
+            @{ id = $_.Id; path = $_.Path; command = $cmd.CommandLine }
+        })
+    }
+}
+$packageExecutable = $null
+if ($selectedPackage -and $selectedPackage.InstallLocation) {
+    $manifest = Get-AppxPackageManifest -Package $selectedPackage.PackageFullName -ErrorAction SilentlyContinue
+    $entryId = ($application -split "!", 2)[1]
+    $entry = $manifest.Package.Applications.Application | Where-Object { $_.Id -eq $entryId } | Select-Object -First 1
+    if ($entry -and $entry.Executable -and ($entry.EntryPoint -eq "Windows.FullTrustApplication" -or $entry.TrustLevel -eq "mediumIL")) {
+        $root = [IO.Path]::GetFullPath($selectedPackage.InstallLocation).TrimEnd("\") + "\"
+        $candidate = [IO.Path]::GetFullPath((Join-Path $root $entry.Executable))
+        if ($candidate.StartsWith($root,[StringComparison]::OrdinalIgnoreCase) -and
+            (Test-Path -LiteralPath $candidate -PathType Leaf) -and
+            (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $candidate) "resources\app.asar") -PathType Leaf)) {
+            $packageExecutable = $candidate
+        }
     }
 }
 $paths = @()
@@ -78,4 +96,4 @@ $paths = @($paths + @($list | ForEach-Object { $_.path }) | Where-Object {
     $_ -and [IO.Path]::IsPathRooted($_) -and [IO.Path]::GetFileName($_) -eq $exe -and
         $_ -notmatch '\\WindowsApps\\' -and (Test-Path -LiteralPath $_ -PathType Leaf)
 })
-@{ package = $application; registered = [bool]($application -or $packages.Count); paths = @($paths); processes = @($list) } | ConvertTo-Json -Depth 4 -Compress
+@{ package = $application; package_executable = $packageExecutable; registered = [bool]($application -or $packages.Count); paths = @($paths); processes = @($list) } | ConvertTo-Json -Depth 4 -Compress

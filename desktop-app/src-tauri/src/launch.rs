@@ -192,6 +192,20 @@ pub fn launch_browser(profile: &Path, port: u16, region: &str, environment: Opti
         .map_err(|_| "Не удалось запустить браузер".into())
 }
 
+pub fn open_probe(profile: &Path, port: u16, environment: Option<&NodeEnvironment>, url: &str) -> Result<(), String> {
+    let browser = find_browser().ok_or("Установите Chrome, Brave или Microsoft Edge")?;
+    if let Some(process) = browser_process(profile)? {
+        let proxy = format!("--proxy-server=socks5://127.0.0.1:{port}");
+        if !process.split_whitespace().any(|arg| arg.trim_matches('"') == proxy) {
+            return Err("Закройте рабочий браузер прежнего подключения и повторите проверку.".into());
+        }
+    } else {
+        update_privacy_preferences(profile).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
+    }
+    spawn(browser_command(&browser, profile, port, environment, url, None))
+        .map_err(|_| "Не удалось открыть страницу проверки".into())
+}
+
 pub fn clear_browser_profile(profile: &Path) -> Result<(), String> {
     if !profile.exists() {
         return Ok(());

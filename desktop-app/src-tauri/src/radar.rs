@@ -1,4 +1,4 @@
-use crate::{apps, dns_radar, launch, service, system_proxy};
+use crate::{apps, dns_radar, launch, service};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -315,7 +315,7 @@ fn https_probe(client: &reqwest::blocking::Client, url: &str) -> HttpsCheck {
 
 pub fn report(
     port: u16, region: &str, app_data: &Path, probe: &BrowserProbe, lookup_geo: bool,
-    check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, progress: impl Fn(&'static str),
+    check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, pac_active: bool, progress: impl Fn(&'static str),
 ) -> Report {
     progress("network");
     let session = service::Session::restore().ok();
@@ -364,7 +364,7 @@ pub fn report(
     let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected };
     let dns = check_dns.then(|| dns_radar::check(port));
 
-    let system_proxy = system_proxy::active(port);
+    let system_proxy = Some(pac_active);
     let apps = apps::installed_apps(Some(port), system_proxy == Some(true));
 
     let timezone = system_timezone();

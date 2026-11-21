@@ -1,4 +1,4 @@
-use crate::launch::{powershell, proxied_command, spawn};
+use crate::launch::{powershell, spawn};
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, process::Command};
 
@@ -40,6 +40,7 @@ struct Process {
 #[derive(Deserialize, Default)]
 struct Discovery {
     package: Option<String>,
+    package_executable: Option<PathBuf>,
     registered: bool,
     paths: Vec<PathBuf>,
     processes: Vec<Process>,
@@ -51,19 +52,22 @@ enum Target {
 }
 
 impl Discovery {
-    fn target(&self) -> Option<Target> {
-        self.package.as_ref().filter(|id| valid_aumid(id))
-            .map(|id| Target::Appx(id.clone()))
-            .or_else(|| self.paths.first().map(|p| Target::Executable(p.clone())))
+    fn target(&self, pac: bool) -> Option<Target> {
+        let store = self.package.as_ref().filter(|id| valid_aumid(id));
+        if pac {
+            if let Some(id) = store { return Some(Target::Appx(id.clone())); }
+        }
+        self.package_executable.as_ref().or_else(|| self.paths.first()).map(|path| Target::Executable(path.clone()))
+            .or_else(|| store.map(|id| Target::Appx(id.clone())))
     }
 
     fn status(&self, port: Option<u16>, system_proxy: bool) -> DesktopStatus {
         let running = !self.processes.is_empty();
-        let target = self.target();
-        let store = matches!(target, Some(Target::Appx(_)));
+        let target = self.target(system_proxy);
+        let store = self.package.as_deref().is_some_and(valid_aumid);
         let proxy = port.is_some_and(|port| self.processes.iter().any(|p|
             p.command.as_deref().is_some_and(|cmd| {
-                let expected = format!("--proxy-server=socks5://127.0.0.1:{port}");
+                let expected = format!("--proxy-server=http://127.0.0.1:{port}");
                 cmd.split_whitespace().any(|arg| arg.trim_matches('"') == expected)
             })));
         DesktopStatus {
@@ -72,7 +76,7 @@ impl Discovery {
             variant: self.package.as_deref().filter(|id| id.starts_with("OpenAI.Codex_")).map(|_| "Codex Desktop"),
             running,
             store,
-            proxy: if proxy { "arguments" } else if running && store && system_proxy { "system" } else { "unknown" },
+            proxy: if proxy { "arguments" } else if running && store && system_proxy { "pac" } else { "unknown" },
         }
     }
 }
@@ -140,10 +144,11 @@ pub fn installed_apps(port: Option<u16>, system_proxy: bool) -> InstalledApps {
 }
 
 fn desktop_command(executable: &Path, port: u16) -> Command {
-    let mut command = proxied_command(executable, port);
+    let mut command = Command::new(executable);
     let http = format!("http://127.0.0.1:{port}");
     let socks = format!("socks5h://127.0.0.1:{port}");
-    command.env("HTTP_PROXY", &http).env("HTTPS_PROXY", &http).env("ALL_PROXY", &socks)
+    command.arg(format!("--proxy-server={http}")).arg("--proxy-bypass-list=<-loopback>")
+        .env("HTTP_PROXY", &http).env("HTTPS_PROXY", &http).env("ALL_PROXY", &socks)
         .env("http_proxy", &http).env("https_proxy", &http).env("all_proxy", &socks)
         .env_remove("NO_PROXY").env_remove("no_proxy");
     command
@@ -187,9 +192,12 @@ exit 1
     Err(format!("Клиент {} остался запущен в фоне. Полностью закройте его и повторите запуск.", app.name()))
 }
 
-pub fn launch(app: DesktopApp, port: u16, restart: bool, enable_store_proxy: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+pub fn launch(app: DesktopApp, port: u16, restart: bool, pac_active: bool) -> Result<(), String> {
     let discovery = discover(app)?;
-    let target = discovery.target().ok_or("Не найден доступный способ запуска клиента")?;
+    let target = discovery.target(pac_active).ok_or("Не найден доступный способ запуска клиента")?;
+    if matches!(target, Target::Appx(_)) && !pac_active {
+        return Err("Для этого клиента включите точечный маршрут Store в настройках Workspace.".into());
+    }
     if !discovery.processes.is_empty() {
         if !restart { return Err("Клиент уже запущен. Выберите перезапуск через туннель.".into()); }
         close_for_restart(app, &discovery.processes)?;
@@ -197,7 +205,6 @@ pub fn launch(app: DesktopApp, port: u16, restart: bool, enable_store_proxy: imp
     let command = match target {
         Target::Executable(path) => desktop_command(&path, port),
         Target::Appx(id) => {
-            enable_store_proxy()?;
             let mut command = Command::new(PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("explorer.exe"));
             command.arg(format!(r"shell:AppsFolder\{id}"));
             command
@@ -211,13 +218,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_package_precedes_classic_executable() {
+    fn process_launch_precedes_store_unless_pac_was_selected() {
         let found: Discovery = serde_json::from_str(r#"{
             "package":"OpenAI.ChatGPT-Desktop_abc123!ChatGPT","registered":true,
             "paths":["C:/Programs/ChatGPT.exe"],"processes":[{"id":123,"command":null}]
         }"#).unwrap();
-        assert!(matches!(found.target(), Some(Target::Appx(_))));
-        assert_eq!(found.status(Some(10081), true).proxy, "system");
+        assert!(matches!(found.target(false), Some(Target::Executable(_))));
+        assert!(matches!(found.target(true), Some(Target::Appx(_))));
+        assert_eq!(found.status(Some(10081), true).proxy, "pac");
         assert_eq!(found.status(Some(10081), false).proxy, "unknown");
         assert!(valid_aumid("OpenAI.Codex_2p2nqsd0c76g0!App"));
         assert!(!valid_aumid("bad\\path!App"));
@@ -239,7 +247,7 @@ mod tests {
     #[test]
     fn current_proxy_port_is_required_for_running_process() {
         let found = Discovery { processes: vec![Process { id: 1, command: Some(
-            "Claude.exe --proxy-server=socks5://127.0.0.1:10081".into()) }], ..Discovery::default() };
+            "Claude.exe --proxy-server=http://127.0.0.1:10081".into()) }], ..Discovery::default() };
         assert!(found.status(None, false).installed);
         assert_eq!(found.status(Some(10081), false).proxy, "arguments");
         assert_eq!(found.status(Some(10082), false).proxy, "unknown");
@@ -249,9 +257,9 @@ mod tests {
     fn classic_windows_discovery_and_arguments() {
         let found: Discovery = serde_json::from_str(r#"{"package":null,"registered":false,
             "paths":["C:/Programs/Claude.exe"],"processes":[]}"#).unwrap();
-        let Some(Target::Executable(exe)) = found.target() else { panic!("expected executable") };
+        let Some(Target::Executable(exe)) = found.target(false) else { panic!("expected executable") };
         let command = desktop_command(&exe, 10081);
-        assert_eq!(command.get_args().next().unwrap(), "--proxy-server=socks5://127.0.0.1:10081");
+        assert_eq!(command.get_args().next().unwrap(), "--proxy-server=http://127.0.0.1:10081");
         assert!(command.get_envs().any(|(name, value)| name == "HTTPS_PROXY" && value == Some(std::ffi::OsStr::new("http://127.0.0.1:10081"))));
     }
 

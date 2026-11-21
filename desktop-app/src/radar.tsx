@@ -2,16 +2,31 @@ export type DesktopClient = 'claude' | 'chatgpt';
 export type DesktopStatus = { installed: boolean; can_launch: boolean; variant?: string|null; running: boolean; store: boolean; proxy: 'arguments' | 'pac' | 'unknown' };
 export type InstalledApps = Record<DesktopClient, DesktopStatus | null>;
 export type Observation = { ip: string; latency_ms: number };
+type MediaStatus = 'working' | 'denied' | 'not_found' | 'not_tested';
+type ProbeStatus = 'confirmed' | 'unmeasured' | 'disabled' | 'mismatch';
+const probeText: Record<ProbeStatus,string> = {
+  confirmed: 'Подтверждено для этой пробы',
+  unmeasured: 'Не измерено',
+  disabled: 'Отключено',
+  mismatch: 'Измерено: адрес отличается от адреса узла',
+};
+const mediaText: Record<MediaStatus,string> = {
+  working: 'Работает', denied: 'Доступ запрещён', not_found: 'Устройство не найдено', not_tested: 'Не проверено',
+};
+
 export type BrowserProbeReport = {
   observed_ip: string | null; timezone: string; offsets: number[]; timezone_matches: boolean | null;
   language: string; languages: string[]; accept_language: string; webdriver: boolean | null;
   geolocation: 'denied' | 'granted' | 'prompt' | 'unknown';
   ice: 'match' | 'mismatch' | 'local' | 'unknown'; stun: boolean;
+  camera?: MediaStatus; microphone?: MediaStatus;
+  upload?: { status: string; received_bytes: number; duration_ms: number; mbps: number | null };
   local_ip?: 'clear' | 'exposed' | 'unknown'; media?: 'working' | 'denied' | 'not_tested';
 };
 
 type ServiceProbe = { state: 'available' | 'restricted' | 'unavailable'; status: number | null };
 export type RadarReport = {
+  platform?: string; probes?: Record<"ipv4" | "ipv6" | "dns", ProbeStatus>;
   network: Observation | null; network_error: string | null; matched: boolean | null;
   geo: { country: string | null; country_code?: string | null; city: string | null; connection: { isp: string | null; asn: number | null } | null } | null;
   browser: {
@@ -93,6 +108,7 @@ export function Radar(props: Props) {
   const browser = report?.browser;
   const service = report?.https;
   const mismatch = report?.timezone_matches === false;
+  const windowsTimeMismatch = mismatch && report?.platform === "windows";
   const browserMismatch = (measured?.timezone_matches ?? browser?.actual?.timezone_matches) === false;
   const language = measured?.language || browser?.actual?.language;
   const localeMismatch = !!browser?.expected_language && !!language && language.toLowerCase() !== browser.expected_language.toLowerCase();
@@ -107,7 +123,7 @@ export function Radar(props: Props) {
   const inspected = clients.find(key => report?.apps[key]?.running && report.apps[key]?.proxy === 'unknown');
   const offerPac = inspected === 'chatgpt' && report?.apps.chatgpt?.store && !report.system_proxy;
   const reconnect = { label: connected ? 'Переподключить' : 'Подключить маршрут', run:props.connect };
-  const timeAction = { label:'Открыть настройки времени', run:props.time };
+  const timeAction = { label:'Открыть настройки времени ОС', run:props.time };
   const limited = service ? clients.filter(key => service[key].state === 'restricted').map(key => clientNames[key]) : [];
   const unreachable = service ? clients.filter(key => service[key].state === 'unavailable').map(key => clientNames[key]) : [];
   const serviceMiss = unreachable.length > 0;
@@ -155,7 +171,7 @@ export function Radar(props: Props) {
     {
       title:'Время на компьютере',
       tone: mismatch || browserMismatch ? 'warning' : report?.timezone_matches ? 'ok' : 'idle',
-      text: mismatch ? (report?.timezone === 'Turkey Standard Time' ? 'Время Windows (Турция) отличается от выбранного региона' : 'Время компьютера отличается от выбранного региона') :
+      text: windowsTimeMismatch ? 'Часовой пояс Windows отличается от пояса узла. Браузер может использовать пояс из настроек Windows. Проверьте настройки времени, затем перезапустите рабочий браузер.' : mismatch ? 'Время компьютера отличается от выбранного региона' :
         browserMismatch ? 'Перезапустите рабочий браузер после смены часового пояса' : report?.timezone_matches ? 'Совпадает с выбранным регионом' : 'Сверка времени ещё не выполнена',
       action: mismatch || browserMismatch ? timeAction : undefined,
     },
@@ -166,14 +182,27 @@ export function Radar(props: Props) {
         report ? clients.some(key => report.apps[key]?.running) ? 'Рабочий маршрут настроен для запущенных клиентов' : 'Лаунчер направляет только рабочий браузер и выбранные приложения' : 'Состояние приложений ещё не проверено',
       action: inspected && report?.apps[inspected]?.can_launch ? {label:offerPac ? 'Включить и перезапустить' : 'Перезапустить через маршрут',run:()=>props.client(inspected, !!offerPac)} : undefined,
     },
-    ...(measured?.media === 'working' || measured?.media === 'denied' ? [{
-      title:'Камера и микрофон', tone: (measured.media === 'working' ? 'ok' : 'warning') as Tone,
-      text: measured.media === 'working' ? 'Проверены и работают' : 'Браузер или система не разрешили доступ',
+    ...([['Камера', measured?.camera], ['Микрофон', measured?.microphone]] as const)
+      .filter(([, value]) => value !== undefined)
+      .map(([title, value]): Row => ({title, text:mediaText[value ?? 'not_tested'],
+        tone:value === 'working' ? 'ok' : value === 'not_tested' ? 'idle' : 'warning'})),
+    ...(!measured?.camera && !measured?.microphone && measured?.media && measured.media !== 'not_tested'
+      ? [{ title:'Камера и микрофон', tone:(measured.media === 'working' ? 'ok' : 'warning') as Tone,
+        text:measured.media === 'working' ? 'Проверены и работают' : 'Доступ запрещён' }]
+      : []),
+    ...(measured?.upload ? [{
+      title:'Загрузка медиа', tone:(measured.upload.status === 'ok' ? 'ok' : 'warning') as Tone,
+      text:measured.upload.status === 'ok' ? 'Сервер получил 10 МБ за ' +
+        (measured.upload.duration_ms / 1000).toLocaleString('ru', {maximumFractionDigits:2}) + ' с' : 'Сервер не получил полный объём данных',
     }] : []),
   ];
+  if (windowsTimeMismatch) {
+    const timeRow = rows.findIndex(row => row.title === 'Время на компьютере');
+    rows.unshift(...rows.splice(timeRow, 1));
+  }
   const details: Array<[string,string]> = report ? [
-    ['IPv4', report.matched === true ? 'Маршрут подтверждён для этой пробы' : report.network ? 'Адрес получен, маршрут не подтверждён' : 'Не проверено'],
-    ['IPv6', measured?.observed_ip?.includes(':') ? 'Браузер сообщил IPv6: ' + measured.observed_ip : 'Не проверено отдельным адресом'],
+    ['IPv4', probeText[report.probes?.ipv4 ?? (report.matched === true ? 'confirmed' : report.matched === false ? 'mismatch' : 'unmeasured')]],
+    ['IPv6', 'Не измерен на этом узле'],
     ['Маршрут Store', report.system_proxy === true ? 'Точечный PAC включён' : 'PAC выключен'],
     ['Accept-Language', measured?.accept_language || 'Не проверено'],
     ['Языки браузера', measured?.languages.join(', ') || 'Не проверено'],
@@ -181,8 +210,8 @@ export function Radar(props: Props) {
     ['Автоматизация', measured?.webdriver === false ? 'Браузер не сообщает об автоматизации' : measured?.webdriver === true ? 'Браузер сообщает об автоматизации' : 'Не проверено'],
     ['HTTPS', service ? clients.map(key => clientNames[key] + ' · ' + (service[key].status ?? 'нет HTTP-ответа')).join(' / ') : 'Не проверено'],
     ['Провайдер / ASN', [report.geo?.connection?.isp, report.geo?.connection?.asn && 'AS' + report.geo.connection.asn].filter(Boolean).join(' · ') || 'Нет данных'],
-    ['DNS-проба', report.dns ? (report.dns.status === 'distinct' ? 'Разные резолверы в этой пробе' : report.dns.status === 'overlap' ? 'Есть совпадения' : 'Не проверено: нет ответа от сервиса сравнения') +
-      ' · SOCKS5 ' + report.dns.tunnel_resolvers + ' / ОС ' + report.dns.system_resolvers : 'Не запрашивалась'],
+    ['DNS-проба', probeText[report.probes?.dns ?? (report.dns ? 'unmeasured' : 'disabled')] +
+      (report.dns?.status === 'distinct' ? ' · разные резолверы' : report.dns?.status === 'overlap' ? ' · есть совпадения' : '')],
     ['WebRTC', measured ? measured.ice + (measured.stun ? ' · внешняя проба' : ' · внешний STUN не запускался') : browser?.webrtc_protected === true ? 'disable_non_proxied_udp' : browser?.webrtc_protected === false ? 'Ограничение выключено' : 'Нет данных'],
     ['Язык браузера', [measured?.language || browser?.actual?.language || browser?.expected_language, browser?.launch_language && '--lang=' + browser.launch_language].filter(Boolean).join(' · ') || 'Нет данных'],
     ['Часовые пояса', [browser?.expected_timezone, report.timezone, measured?.timezone || browser?.actual?.timezone].filter(Boolean).join(' / ') || 'Нет данных'],

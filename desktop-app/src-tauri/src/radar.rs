@@ -282,7 +282,27 @@ fn classify_https(status: Option<u16>) -> HttpsCheck {
 }
 
 #[derive(Serialize)]
+struct NetworkProbes {
+    ipv4: &'static str,
+    ipv6: &'static str,
+    dns: &'static str,
+}
+
+fn network_probes(matched: Option<bool>, check_dns: bool, dns: Option<&dns_radar::DnsReport>) -> NetworkProbes {
+    NetworkProbes {
+        ipv4: match matched { Some(true) => "confirmed", Some(false) => "mismatch", None => "unmeasured" },
+        // This native observation compares IPv4 only.
+        ipv6: "unmeasured",
+        dns: if !check_dns { "disabled" } else if dns.is_some_and(dns_radar::DnsReport::measured) {
+            "confirmed"
+        } else { "unmeasured" },
+    }
+}
+
+#[derive(Serialize)]
 pub struct Report {
+    platform: &'static str,
+    probes: NetworkProbes,
     network: Option<Observation>,
     network_error: Option<String>,
     matched: Option<bool>,
@@ -414,7 +434,8 @@ pub fn report(
         if timezone_matches == Some(true) { ready += 1; }
         else { hints.push("Сверьте часовой пояс Windows с выбранным узлом."); }
     }
-    Report { network, network_error, matched, geo, dns, devices, browser, timezone, timezone_matches, https, system_proxy, apps, ready, total, hints }
+    let probes = network_probes(matched, check_dns, dns.as_ref());
+    Report { platform: std::env::consts::OS, probes, network, network_error, matched, geo, dns, devices, browser, timezone, timezone_matches, https, system_proxy, apps, ready, total, hints }
 }
 
 #[cfg(test)]
@@ -483,6 +504,7 @@ mod tests {
     #[test]
     fn report_keeps_unknown_distinct_from_failed_and_includes_readiness() {
         let report = Report {
+            platform: "windows", probes: network_probes(Some(false), false, None),
             network: Some(Observation { ip: "8.8.8.8".parse().unwrap(), latency_ms: 123 }),
             network_error: None, matched: Some(false), geo: None, dns: None, devices: None,
             browser: Browser { running: Some(true), expected_timezone: Some("Europe/Berlin".into()), expected_language: Some("de-DE".into()),
@@ -494,6 +516,7 @@ mod tests {
         assert_eq!(json["network"]["ip"], "8.8.8.8");
         assert_eq!(json["network"]["latency_ms"], 123);
         assert_eq!(json["matched"], false);
+        assert_eq!(json["probes"], serde_json::json!({"ipv4":"mismatch", "ipv6":"unmeasured", "dns":"disabled"}));
         assert!(json["browser"]["actual"].is_null());
         assert_eq!(json["total"], 5);
     }

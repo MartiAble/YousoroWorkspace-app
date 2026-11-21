@@ -18,6 +18,8 @@ fn outcome(tunnel: &BTreeSet<IpAddr>, system: &BTreeSet<IpAddr>) -> DnsReport {
 }
 
 impl DnsReport {
+    pub fn measured(&self) -> bool { self.status != "unavailable" }
+
     pub fn distinct(&self) -> bool { self.status == "distinct" }
 }
 

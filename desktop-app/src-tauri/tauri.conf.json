@@ -1,6 +1,6 @@
 {
   "productName": "Yousoro Workspace",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "identifier": "ru.yousoro.workspace",
   "build": {
     "beforeDevCommand": "npm run dev",

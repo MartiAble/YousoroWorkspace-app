@@ -161,22 +161,19 @@ fn profile_in_command(line: &str, path: &Path) -> bool {
 }
 
 pub fn browser_process(profile: &Path) -> Result<Option<String>, String> {
-    let result = if cfg!(target_os = "macos") {
-        Command::new("/bin/ps").args(["-axww", "-o", "command="]).output()
-    } else {
-        powershell(r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-Get-CimInstance Win32_Process -Filter "Name = 'chrome.exe' OR Name = 'brave.exe' OR Name = 'msedge.exe'" |
-    ForEach-Object { $_.CommandLine }
-"#).output()
-    };
     let error = "Не удалось проверить, закрыт ли рабочий браузер";
-    let output = result.map_err(|_| error)?;
-    if !output.status.success() {
-        return Err(error.into());
+    #[cfg(windows)]
+    {
+        let processes = crate::native_windows::processes(&["chrome.exe", "brave.exe", "msedge.exe"]).map_err(|_| error)?;
+        Ok(processes.into_iter().filter_map(|process| process.command)
+            .find(|line| profile_in_command(line, profile) && !line.contains("--type=")))
     }
-    Ok(String::from_utf8_lossy(&output.stdout).lines().find(|line| profile_in_command(line, profile) && !line.contains("--type=")).map(str::to_owned))
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("/bin/ps").args(["-axww", "-o", "command="]).output().map_err(|_| error)?;
+        if !output.status.success() { return Err(error.into()); }
+        Ok(String::from_utf8_lossy(&output.stdout).lines().find(|line| profile_in_command(line, profile) && !line.contains("--type=")).map(str::to_owned))
+    }
 }
 
 pub fn launch_browser(profile: &Path, port: u16, region: &str, environment: Option<&NodeEnvironment>, url: &str, probe: &crate::radar::BrowserProbe) -> Result<(), String> {
@@ -214,19 +211,6 @@ pub fn clear_browser_profile(profile: &Path) -> Result<(), String> {
         return Err("Закройте рабочий браузер этого региона перед очисткой профиля".into());
     }
     fs::remove_dir_all(profile).map_err(|_| "Не удалось очистить рабочий профиль".into())
-}
-
-pub fn powershell(script: &str) -> Command {
-    let mut command = Command::new(PathBuf::from(
-        std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())
-    ).join(r"System32\WindowsPowerShell\v1.0\powershell.exe"));
-    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x08000000);
-    }
-    command
 }
 
 pub fn spawn(mut command: Command) -> io::Result<()> {

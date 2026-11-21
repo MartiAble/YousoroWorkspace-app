@@ -9,7 +9,7 @@ use std::{
 
 const DIAGNOSTICS: &str = service::DIAGNOSTICS_ORIGIN;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Observation {
     pub ip: Ipv4Addr,
     latency_ms: u64,
@@ -25,7 +25,7 @@ fn public_ipv4(value: &str) -> Option<Ipv4Addr> {
 
 fn client(port: u16) -> Result<reqwest::blocking::Client, String> {
     let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).map_err(|_| "Некорректный адрес прокси")?;
-    reqwest::blocking::Client::builder().proxy(proxy).timeout(Duration::from_secs(8))
+    reqwest::blocking::Client::builder().proxy(proxy).timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Не удалось настроить диагностику".into())
 }
 
@@ -301,12 +301,13 @@ pub struct Report {
 }
 
 fn system_timezone() -> Option<String> {
-    if cfg!(windows) {
-        let output = launch::powershell("(Get-TimeZone).Id").output().ok()?;
-        return output.status.success().then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    #[cfg(windows)]
+    { crate::native_windows::timezone() }
+    #[cfg(not(windows))]
+    {
+        let link = fs::read_link("/etc/localtime").ok()?;
+        link.to_str()?.split_once("zoneinfo/").map(|(_, zone)| zone.to_owned())
     }
-    let link = fs::read_link("/etc/localtime").ok()?;
-    link.to_str()?.split_once("zoneinfo/").map(|(_, zone)| zone.to_owned())
 }
 
 fn https_probe(client: &reqwest::blocking::Client, url: &str) -> HttpsCheck {
@@ -315,32 +316,40 @@ fn https_probe(client: &reqwest::blocking::Client, url: &str) -> HttpsCheck {
 
 pub fn report(
     port: u16, region: &str, app_data: &Path, probe: &BrowserProbe, lookup_geo: bool,
-    check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, pac_active: bool, progress: impl Fn(&'static str),
+    check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, pac_active: bool, apps: apps::InstalledApps, progress: impl Fn(&'static str),
 ) -> Report {
     progress("network");
     let session = service::Session::restore().ok();
-    let (network, network_error, matched, geo, https) = match client(port) {
+    let (network, network_error, matched, geo, https, dns, devices) = std::thread::scope(|scope| {
+        let dns = scope.spawn(|| check_dns.then(|| dns_radar::check(port)));
+        let devices = scope.spawn(|| session.as_ref().and_then(|session| service::account(session).ok())
+            .map(|account| device_slots(&account.bound, device_id)));
+        let (network, network_error, matched, geo, https) = match client(port) {
         Ok(client) => {
-            let observation = observe(&client);
-            let gateway = session.as_ref().and_then(|session| tunnel_check(&client, session));
+            let (observation, gateway) = std::thread::scope(|scope| {
+                let probe = scope.spawn(|| session.as_ref().and_then(|session| tunnel_check(&client, session)));
+                (observe(&client), probe.join().ok().flatten())
+            });
             let result = reconcile(observation, gateway);
             progress("services");
-            let (claude, chatgpt) = std::thread::scope(|scope| {
+            let (claude, chatgpt, geo) = std::thread::scope(|scope| {
                 let claude = scope.spawn(|| https_probe(&client, "https://claude.ai/"));
                 let chatgpt = scope.spawn(|| https_probe(&client, "https://chatgpt.com/"));
-                (claude.join().unwrap_or_else(|_| classify_https(None)), chatgpt.join().unwrap_or_else(|_| classify_https(None)))
+                let geo = if lookup_geo { result.0.as_ref().ok().and_then(|observation| geoip(observation.ip)) } else { None };
+                (claude.join().unwrap_or_else(|_| classify_https(None)), chatgpt.join().unwrap_or_else(|_| classify_https(None)), geo)
             });
             let https = Some(HttpsTargets { claude, chatgpt });
             match result {
                 (Ok(observation), matched) => {
-                    let geo = lookup_geo.then(|| geoip(observation.ip)).flatten();
                     (Some(observation), None, matched, geo, https)
                 }
                 (Err(error), _) => (None, Some(error), None, None, https),
             }
         }
         Err(error) => (None, Some(error), None, None, None),
-    };
+        };
+        (network, network_error, matched, geo, https, dns.join().ok().flatten(), devices.join().ok().flatten())
+    });
 
     progress("profile");
     let expected_timezone = environment.map(|node| node.timezone.clone());
@@ -362,17 +371,13 @@ pub fn report(
             .map(|setting| setting == "disable_non_proxied_udp"));
     let actual = (running == Some(true)).then(|| probe.observation(port, region)).flatten();
     let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected };
-    let dns = check_dns.then(|| dns_radar::check(port));
 
     let system_proxy = Some(pac_active);
-    let apps = apps::installed_apps(Some(port), system_proxy == Some(true));
 
     let timezone = system_timezone();
     let timezone_matches = timezone.as_deref().zip(environment).map(|(actual, expected)| {
         actual.eq_ignore_ascii_case(if cfg!(windows) { &expected.windows_timezone } else { &expected.timezone })
     });
-    let devices = session.as_ref().and_then(|session| service::account(session).ok())
-        .map(|account| device_slots(&account.bound, device_id));
     let checks = [
         (network.is_some(), "Проверьте, что туннель подключён и сервер диагностики доступен."),
         (https.as_ref().is_some_and(|target| target.claude.state == HttpsState::Available && target.chatgpt.state == HttpsState::Available), "Повторите HTTPS-проверку после переподключения."),

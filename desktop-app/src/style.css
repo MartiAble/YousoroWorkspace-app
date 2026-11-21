@@ -191,3 +191,8 @@ button.quiet{border-color:transparent;background:transparent;color:var(--muted)}
 @media(min-width:1000px){.radar-intro h2{white-space:nowrap}}
 @media(max-width:850px){.radar-controls{justify-content:start}.radar-support{justify-self:start}}
 @media(max-width:480px){.radar-controls{display:flex;flex-wrap:wrap}}
+
+.refresh-clients{align-self:flex-start;margin-top:8px}
+.launch-spinner{display:inline-block;width:.8em;height:.8em;margin-right:.45em;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;vertical-align:-.08em;animation:launch-spin .7s linear infinite}
+@keyframes launch-spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.launch-spinner{animation:none}}

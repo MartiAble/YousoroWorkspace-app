@@ -1,6 +1,8 @@
-use crate::launch::powershell;
 use std::{fs, io, path::{Path, PathBuf}};
 
+#[cfg(windows)]
+const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
 const STARTUP_VALUE: &str = "YousoroWorkspace";
 
 fn tray_file(data: &Path) -> PathBuf { data.join("close-to-tray") }
@@ -18,42 +20,43 @@ pub fn set_close_to_tray(data: &Path, enabled: bool) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn launch_agent() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").ok_or("Не удалось определить домашнюю папку")?;
     Ok(PathBuf::from(home).join("Library/LaunchAgents/ru.yousoro.workspace.plist"))
 }
 
 pub fn autostart() -> Result<bool, String> {
-    if cfg!(windows) {
-        let output = powershell(r#"
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-if (Get-ItemProperty -Path $key -Name $env:WORKSPACE_STARTUP_VALUE -ErrorAction SilentlyContinue) { 'yes' } else { 'no' }
-"#).env("WORKSPACE_STARTUP_VALUE", STARTUP_VALUE).output().map_err(|_| "Не удалось проверить автозапуск")?;
-        if !output.status.success() { return Err("Windows не вернула статус автозапуска".into()); }
-        return Ok(String::from_utf8_lossy(&output.stdout).trim() == "yes");
-    }
+    #[cfg(windows)]
+    return match crate::native_windows::Key::user(STARTUP_KEY, false) {
+        Ok(key) => key.string(STARTUP_VALUE).map(|value| value.is_some()).map_err(|_| "Не удалось проверить автозапуск".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("Не удалось проверить автозапуск".into()),
+    };
+    #[cfg(not(windows))]
+    {
     if cfg!(target_os = "macos") { return Ok(launch_agent()?.is_file()); }
     Ok(false)
+    }
 }
 
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     let binary = std::env::current_exe().map_err(|_| "Не найден файл приложения")?;
-    if cfg!(windows) {
-        let status = powershell(r#"
-$ErrorActionPreference = 'Stop'
-$key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
-$name = $env:WORKSPACE_STARTUP_VALUE
-if ($env:WORKSPACE_STARTUP_ENABLED -eq '1') {
-  if (!(Test-Path -LiteralPath $key)) { $null = New-Item -Path $key -Force }
-  Set-ItemProperty -LiteralPath $key -Name $name -Value ('"' + $env:WORKSPACE_STARTUP_BINARY + '"')
-} elseif (Get-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue) {
-  Remove-ItemProperty -LiteralPath $key -Name $name
-}
-"#).env("WORKSPACE_STARTUP_VALUE", STARTUP_VALUE).env("WORKSPACE_STARTUP_BINARY", binary)
-        .env("WORKSPACE_STARTUP_ENABLED", if enabled { "1" } else { "0" })
-        .status().map_err(|_| "Не удалось изменить автозапуск")?;
-        return if status.success() { Ok(()) } else { Err("Windows не сохранила настройки автозапуска".into()) };
+    #[cfg(windows)]
+    {
+        let key = if enabled { crate::native_windows::Key::user_create(STARTUP_KEY) }
+            else { crate::native_windows::Key::user(STARTUP_KEY, true) };
+        return match key {
+            Ok(key) => {
+                let command = enabled.then(|| format!("\"{}\"", binary.display()));
+                key.set_string(STARTUP_VALUE, command.as_deref()).map_err(|_| "Windows не сохранила настройки автозапуска".into())
+            }
+            Err(error) if !enabled && error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err("Не удалось изменить автозапуск".into()),
+        };
     }
+    #[cfg(not(windows))]
+    {
     if cfg!(target_os = "macos") {
         let path = launch_agent()?;
         if enabled {
@@ -69,4 +72,5 @@ if ($env:WORKSPACE_STARTUP_ENABLED -eq '1') {
         return Ok(());
     }
     Err("Автозапуск не поддерживается на этой системе".into())
+    }
 }

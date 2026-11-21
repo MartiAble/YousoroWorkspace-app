@@ -1,4 +1,4 @@
-use crate::launch::{powershell, spawn};
+use crate::launch::spawn;
 use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, process::Command};
 
@@ -11,6 +11,7 @@ impl DesktopApp {
         match self { Self::Claude => "Claude", Self::Chatgpt => "ChatGPT" }
     }
 
+    #[cfg(any(not(windows), test))]
     fn mac_executable(self, root: &Path) -> Option<PathBuf> {
         let name = self.name();
         let bundle = root.join(format!("{name}.app/Contents"));
@@ -26,24 +27,28 @@ impl DesktopApp {
     }
 }
 
+#[cfg(any(not(windows), test))]
 fn mac_bundle_binary(contents: &Path, executable: &str) -> Option<PathBuf> {
     (!executable.is_empty() && !executable.contains(['/', '\\', '\0']) && executable != "." && executable != "..")
         .then(|| contents.join("MacOS").join(executable))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone)]
 struct Process {
     id: u32,
     command: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 struct Discovery {
     package: Option<String>,
     package_executable: Option<PathBuf>,
     registered: bool,
     paths: Vec<PathBuf>,
+    #[serde(skip)]
     processes: Vec<Process>,
+    #[serde(default)]
+    package_root: Option<PathBuf>,
 }
 
 enum Target {
@@ -88,38 +93,165 @@ fn valid_aumid(id: &str) -> bool {
     })
 }
 
-fn discover(app: DesktopApp) -> Result<Discovery, String> {
-    if cfg!(windows) {
-        let output = powershell(include_str!("discover_windows_apps.ps1"))
-            .env("WORKSPACE_DESKTOP_APP", app.name()).output()
-            .map_err(|_| "Не удалось запустить поиск приложений Windows")?;
-        if !output.status.success() { return Err("Windows не завершила поиск приложений".into()); }
-        return serde_json::from_slice(&output.stdout).map_err(|_| "Windows вернула некорректный список приложений".into());
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Installations([Discovery; 2]);
+
+fn discover_installed_clients() -> Installations {
+    #[cfg(windows)]
+    {
+        let [claude, openai] = crate::native_windows::discover_packages();
+        Installations([claude, openai].map(|package| {
+            let mut found = Discovery::default();
+            if let Some(package) = package {
+                found.package = Some(package.aumid);
+                found.package_executable = package.executable;
+                found.package_root = Some(package.root);
+                found.registered = true;
+            }
+            found
+        })).with_classic()
     }
-    if cfg!(target_os = "macos") {
-        let name = app.name();
-        let paths: Vec<_> = std::iter::once(PathBuf::from("/Applications"))
-            .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications")))
-            .filter_map(|root| app.mac_executable(&root)).collect();
-        let output = Command::new("/bin/ps").args(["-axww", "-o", "pid=", "-o", "command="]).output()
-            .map_err(|_| "Не удалось проверить процессы macOS")?;
-        if !output.status.success() { return Err("macOS не вернула список процессов".into()); }
-        let mut markers = vec![format!("/{name}.app/Contents/MacOS/{name}")];
-        for path in &paths {
-            if let Some(binary) = path.file_name().and_then(|value| value.to_str()) {
-                markers.push(format!("/{name}.app/Contents/MacOS/{binary}"));
+    #[cfg(not(windows))]
+    {
+        Installations([DesktopApp::Claude, DesktopApp::Chatgpt].map(|client| Discovery {
+            paths: std::iter::once(PathBuf::from("/Applications"))
+                .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications")))
+                .filter_map(|root| client.mac_executable(&root)).collect(),
+            ..Discovery::default()
+        }))
+    }
+}
+
+impl Installations {
+    #[cfg(windows)]
+    fn with_classic(mut self) -> Self {
+        for (index, app) in self.0.iter_mut().enumerate() {
+            app.paths.extend(crate::native_windows::discover_classic(index == 0));
+        }
+        self
+    }
+
+    fn validate(mut self) -> Self {
+        for found in &mut self.0 {
+            found.paths.retain(|path| path.is_file());
+            if found.package_executable.as_ref().is_some_and(|path| !path.is_file()) {
+                found.package_executable = None;
+            }
+            if found.package_root.as_ref().is_some_and(|root| !root.is_dir()) {
+                found.package = None;
+                found.package_root = None;
+                found.package_executable = None;
+                found.registered = false;
             }
         }
-        let processes = String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
-            let (pid, command) = line.trim_start().split_once(' ')?;
-            let command = command.trim_start();
-            let (prefix, tail) = markers.iter().find_map(|marker| command.split_once(marker.as_str()))?;
-            if !prefix.starts_with('/') || prefix.contains(" -") || (!tail.is_empty() && !tail.starts_with(' ')) { return None; }
-            Some(Process { id: pid.parse().ok()?, command: Some(command.to_owned()) })
-        }).collect();
-        return Ok(Discovery { paths, processes, ..Discovery::default() });
+        self
     }
-    Ok(Discovery::default())
+
+    fn read(data: &Path) -> Option<Self> {
+        serde_json::from_slice::<Self>(&std::fs::read(data.join("desktop-installations.json")).ok()?)
+            .ok().map(Self::validate)
+    }
+
+    fn save(&self, data: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(data)?;
+        let temporary = data.join("desktop-installations.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
+        std::fs::rename(temporary, data.join("desktop-installations.json"))
+    }
+
+    fn check_running_clients(mut self) -> Result<Self, String> {
+        #[cfg(windows)]
+        {
+            let processes = crate::native_windows::processes(&["claude.exe", "chatgpt.exe", "codex.exe"])
+                .map_err(|_| "Не удалось проверить процессы Windows")?;
+            for process in processes {
+                let index = usize::from(!process.name.eq_ignore_ascii_case("claude.exe"));
+                let found = &mut self.0[index];
+                let image = process.image.as_deref();
+                let from_package = image.zip(found.package_root.as_deref()).is_some_and(|(image, root)| {
+                    let image = image.to_string_lossy().to_ascii_lowercase();
+                    let root = root.to_string_lossy().to_ascii_lowercase();
+                    image.strip_prefix(&root).is_some_and(|tail| tail.starts_with(['\\', '/']))
+                });
+                let codex = process.name.eq_ignore_ascii_case("codex.exe");
+                if codex && !from_package { continue; }
+                if process.command.as_deref().is_some_and(|command| command.contains(" --type=")) { continue; }
+                if !codex && !from_package && found.paths.is_empty() {
+                    found.paths.extend(image.filter(|path| path.is_file()).map(Path::to_path_buf));
+                }
+                found.processes.push(Process { id: process.id, command: process.command });
+            }
+        }
+        #[cfg(not(windows))]
+        if cfg!(target_os = "macos") {
+            let output = Command::new("/bin/ps").args(["-axww", "-o", "pid=", "-o", "command="]).output()
+                .map_err(|_| "Не удалось проверить процессы macOS")?;
+            if !output.status.success() { return Err("macOS не вернула список процессов".into()); }
+            let list = String::from_utf8_lossy(&output.stdout);
+            for (client, found) in [DesktopApp::Claude, DesktopApp::Chatgpt].into_iter().zip(self.0.iter_mut()) {
+                let name = client.name();
+                let entries = std::iter::once(name).chain(found.paths.iter().filter_map(|p| p.file_name()?.to_str()));
+                let markers: Vec<_> = entries.map(|binary| format!("/{name}.app/Contents/MacOS/{binary}")).collect();
+                found.processes = list.lines().filter_map(|line| {
+                    let (pid, command) = line.trim_start().split_once(' ')?;
+                    let command = command.trim_start();
+                    let (prefix, tail) = markers.iter().find_map(|marker| command.split_once(marker))?;
+                    if !prefix.starts_with('/') || prefix.contains(" -") || (!tail.is_empty() && !tail.starts_with(' ')) { return None; }
+                    Some(Process { id: pid.parse().ok()?, command: Some(command.to_owned()) })
+                }).collect();
+            }
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Default)]
+pub struct AppCache {
+    installs: std::sync::Mutex<Option<Installations>>,
+    running: std::sync::Mutex<Option<Installations>>,
+    refresh: crate::SingleFlight,
+    poll: crate::SingleFlight,
+}
+
+impl AppCache {
+    fn cached(&self, data: &Path) -> Result<Installations, String> {
+        if let Some(found) = self.installs.lock().map_err(|_| "Ошибка кэша клиентов")?.clone() {
+            return Ok(found);
+        }
+        if let Some(found) = Installations::read(data) {
+            let mut cache = self.installs.lock().map_err(|_| "Ошибка кэша клиентов")?;
+            return Ok(cache.get_or_insert(found).clone());
+        }
+        self.refresh(data)
+    }
+
+    fn refresh(&self, data: &Path) -> Result<Installations, String> {
+        let Some(_job) = self.refresh.try_enter() else {
+            return self.installs.lock().ok().and_then(|result| result.clone())
+                .ok_or("Обнаружение клиентов ещё выполняется".into());
+        };
+        let found = discover_installed_clients();
+        *self.installs.lock().map_err(|_| "Ошибка кэша клиентов")? = Some(found.clone());
+        let _ = found.save(data);
+        Ok(found)
+    }
+
+    pub fn rediscover(&self, data: &Path) -> Result<(), String> {
+        self.refresh(data).map(|_| ())
+    }
+
+    pub fn check_running_clients(&self, data: &Path, port: Option<u16>, pac: bool) -> Result<InstalledApps, String> {
+        let installed = self.cached(data)?;
+        let found = if let Some(_job) = self.poll.try_enter() {
+            let found = installed.check_running_clients()?;
+            *self.running.lock().map_err(|_| "Ошибка кэша процессов")? = Some(found.clone());
+            found
+        } else {
+            self.running.lock().map_err(|_| "Ошибка кэша процессов")?.clone().unwrap_or(installed)
+        };
+        let [claude, chatgpt] = found.0;
+        Ok(InstalledApps { claude: Some(claude.status(port, pac)), chatgpt: Some(chatgpt.status(port, pac)) })
+    }
 }
 
 #[derive(Serialize)]
@@ -132,15 +264,10 @@ pub struct DesktopStatus {
     pub proxy: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 pub struct InstalledApps {
     pub claude: Option<DesktopStatus>,
     pub chatgpt: Option<DesktopStatus>,
-}
-
-pub fn installed_apps(port: Option<u16>, system_proxy: bool) -> InstalledApps {
-    let status = |client| discover(client).ok().map(|app| app.status(port, system_proxy));
-    InstalledApps { claude: status(DesktopApp::Claude), chatgpt: status(DesktopApp::Chatgpt) }
 }
 
 fn desktop_command(executable: &Path, port: u16) -> Command {
@@ -154,63 +281,60 @@ fn desktop_command(executable: &Path, port: u16) -> Command {
     command
 }
 
-fn close_for_restart(app: DesktopApp, running: &[Process]) -> Result<(), String> {
-    let ids = running.iter().map(|p| p.id.to_string()).collect::<Vec<_>>().join(",");
-    if cfg!(windows) {
-        powershell(r#"
-$ids = $env:WORKSPACE_CLOSE_PIDS -split ',' | ForEach-Object { [int]$_ }
-Get-Process -Id $ids -ErrorAction SilentlyContinue |
-    Where-Object { $_.SessionId -eq (Get-Process -Id $PID).SessionId -and $_.MainWindowHandle -ne 0 } |
-    ForEach-Object { $null = $_.CloseMainWindow() }
-"#).env("WORKSPACE_CLOSE_PIDS", &ids)
-            .output().map_err(|_| "Не удалось закрыть окно клиента")?;
-    } else {
-        for process in running {
-            Command::new("/bin/kill").args(["-TERM", &process.id.to_string()]).output()
-                .map_err(|_| "Не удалось закрыть клиент")?;
-        }
+fn close_for_restart(app: DesktopApp, installed: &Installations, running: &[Process]) -> Result<(), String> {
+    #[cfg(windows)]
+    crate::native_windows::close_windows(&running.iter().map(|process| process.id).collect::<Vec<_>>());
+    #[cfg(not(windows))]
+    for process in running {
+        Command::new("/bin/kill").args(["-TERM", &process.id.to_string()]).output()
+            .map_err(|_| "Не удалось закрыть клиент")?;
     }
-    // Wait for the main window and its helpers to leave before starting a new instance.
-    if cfg!(windows) {
-        let output = powershell(r#"
-$session = (Get-Process -Id $PID).SessionId
-$ids = $env:WORKSPACE_CLOSE_PIDS -split ',' | ForEach-Object { [int]$_ }
-for ($i = 0; $i -lt 20; $i++) {
-    if (!(Get-Process -Id $ids -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session })) { exit 0 }
-    Start-Sleep -Milliseconds 250
-}
-exit 1
-"#).env("WORKSPACE_CLOSE_PIDS", &ids).status()
-            .map_err(|_| "Не удалось проверить закрытие клиента")?;
-        if output.success() { return Ok(()); }
-    } else {
-        for _ in 0..12 {
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            if discover(app)?.processes.is_empty() { return Ok(()); }
-        }
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if installed.clone().check_running_clients()?.0[app as usize].processes.is_empty() { return Ok(()); }
     }
     Err(format!("Клиент {} остался запущен в фоне. Полностью закройте его и повторите запуск.", app.name()))
 }
 
-pub fn launch(app: DesktopApp, port: u16, restart: bool, pac_active: bool) -> Result<(), String> {
-    let discovery = discover(app)?;
-    let target = discovery.target(pac_active).ok_or("Не найден доступный способ запуска клиента")?;
-    if matches!(target, Target::Appx(_)) && !pac_active {
-        return Err("Для этого клиента включите точечный маршрут Store в настройках Workspace.".into());
-    }
-    if !discovery.processes.is_empty() {
-        if !restart { return Err("Клиент уже запущен. Выберите перезапуск через туннель.".into()); }
-        close_for_restart(app, &discovery.processes)?;
-    }
-    let command = match target {
-        Target::Executable(path) => desktop_command(&path, port),
-        Target::Appx(id) => {
-            let mut command = Command::new(PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("explorer.exe"));
-            command.arg(format!(r"shell:AppsFolder\{id}"));
-            command
+pub fn launch(cache: &AppCache, data: &Path, app: DesktopApp, port: u16, restart: bool, pac_active: bool) -> Result<(), String> {
+    let mut installations = cache.cached(data)?;
+    for retry in [false, true] {
+        let active = installations.clone().check_running_clients()?;
+        let found = &active.0[app as usize];
+        let target = found.target(pac_active);
+        let missing = match target.as_ref() {
+            Some(Target::Executable(path)) => !path.is_file(),
+            Some(Target::Appx(_)) => found.package_root.as_ref().is_some_and(|root| !root.is_dir()),
+            None => true,
+        };
+        if missing {
+            if retry { return Err("Не найден доступный способ запуска клиента".into()); }
+            installations = cache.refresh(data)?;
+            continue;
         }
-    };
-    spawn(command).map_err(|_| format!("Не удалось запустить {}", app.name()))
+        let target = target.ok_or("Не найден доступный способ запуска клиента")?;
+        if matches!(target, Target::Appx(_)) && !pac_active {
+            return Err("Для этого клиента включите точечный маршрут Store в настройках Workspace.".into());
+        }
+        if !found.processes.is_empty() {
+            if !restart { return Err("Клиент уже запущен. Выберите перезапуск через туннель.".into()); }
+            close_for_restart(app, &installations, &found.processes)?;
+        }
+        let command = match target {
+            Target::Executable(path) => desktop_command(&path, port),
+            Target::Appx(id) => {
+                let mut command = Command::new(PathBuf::from(std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into())).join("explorer.exe"));
+                command.arg(format!(r"shell:AppsFolder\{id}"));
+                command
+            }
+        };
+        match spawn(command) {
+            Ok(()) => return Ok(()),
+            Err(error) if !retry && error.kind() == std::io::ErrorKind::NotFound => installations = cache.refresh(data)?,
+            Err(_) => return Err(format!("Не удалось запустить {}", app.name())),
+        }
+    }
+    Err(format!("Не удалось запустить {}", app.name()))
 }
 
 #[cfg(test)]
@@ -218,11 +342,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preserves_and_validates_cached_installations_without_serializing_processes() {
+        let data = std::env::temp_dir().join(format!("workspace-installations-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        let executable = data.join("Claude.exe");
+        std::fs::write(&executable, "").unwrap();
+        let package = data.join("Codex");
+        std::fs::create_dir_all(&package).unwrap();
+        let cached = Installations([
+            Discovery { paths: vec![executable.clone()], processes: vec![Process { id: 42, command: Some("unpersisted".into()) }], ..Discovery::default() },
+            Discovery { package_root: Some(package.clone()), package: Some("OpenAI.Codex_publisher!App".into()), registered: true, ..Discovery::default() },
+        ]);
+        cached.save(&data).unwrap();
+        let cache = AppCache::default();
+        let first = cache.cached(&data).unwrap();
+        assert_eq!(first.0[0].paths, vec![executable.clone()]);
+        assert!(first.0[0].processes.is_empty());
+        assert!(first.0[1].registered);
+        std::fs::remove_file(&executable).unwrap();
+        std::fs::remove_dir(&package).unwrap();
+        assert_eq!(cache.cached(&data).unwrap().0[0].paths, vec![executable]);
+        let from_disk = AppCache::default().cached(&data).unwrap();
+        assert!(from_disk.0[0].paths.is_empty());
+        assert!(!from_disk.0[1].registered);
+        cached.save(&data).unwrap();
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
     fn process_launch_precedes_store_unless_pac_was_selected() {
-        let found: Discovery = serde_json::from_str(r#"{
+        let mut found: Discovery = serde_json::from_str(r#"{
             "package":"OpenAI.ChatGPT-Desktop_abc123!ChatGPT","registered":true,
             "paths":["C:/Programs/ChatGPT.exe"],"processes":[{"id":123,"command":null}]
         }"#).unwrap();
+        found.processes.push(Process { id: 123, command: None });
         assert!(matches!(found.target(false), Some(Target::Executable(_))));
         assert!(matches!(found.target(true), Some(Target::Appx(_))));
         assert_eq!(found.status(Some(10081), true).proxy, "pac");

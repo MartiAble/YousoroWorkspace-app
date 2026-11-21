@@ -42,6 +42,33 @@ function App() {
   const busy = working || updates.phase === 'downloading' || updates.phase === 'installing';
   const [message,setMessage] = useState('');
   const [installed,setInstalled] = useState<InstalledApps|null>(null);
+  const [launching,setLaunching] = useState<Partial<Record<DesktopClient,boolean>>>({});
+  const launchLocks = useRef(new Set<DesktopClient>());
+  const clientCheck = useRef<Promise<void>|null>(null);
+  const [refreshingClients,setRefreshingClients] = useState(false);
+  const connecting = useRef<Promise<Connection>|null>(null);
+
+  function refreshClients() {
+    if (!clientCheck.current) {
+      clientCheck.current = invoke<InstalledApps>('check_running_clients')
+        .then(result => setInstalled(previous => ({
+          claude: result.claude ?? previous?.claude ?? null,
+          chatgpt: result.chatgpt ?? previous?.chatgpt ?? null,
+        })))
+        .finally(() => { clientCheck.current = null; });
+    }
+    return clientCheck.current;
+  }
+
+  async function rediscoverClients() {
+    setRefreshingClients(true);
+    try {
+      await invoke('discover_installed_clients');
+      await clientCheck.current?.catch(() => {});
+      await refreshClients();
+    } catch(e) { setError(String(e)); }
+    finally { setRefreshingClients(false); }
+  }
   const [resetRegion,setResetRegion] = useState<string|null>(null);
   const profileRegion = connection.region || account?.profile.applied;
   useEffect(() => {
@@ -53,11 +80,11 @@ function App() {
     return () => { void radarLink.then(unlisten => unlisten()).catch(() => {}); void progress.then(unlisten => unlisten()).catch(() => {}); };
   }, []);
   useEffect(() => { setResetRegion(null); setCopied(''); }, [profileRegion, tab]);
+  useEffect(() => { setProfileState(null); }, [profileRegion]);
   useEffect(() => {
     if (!native || tab !== 0 || !profileRegion) return;
     let active = true;
     const update = () => { void invoke<ProfileState>('browser_profile_state',{region:profileRegion}).then(value => { if (active) setProfileState(value); }).catch(() => {}); };
-    setProfileState(null);
     update();
     const interval = window.setInterval(update, 8000);
     window.addEventListener('focus', update);
@@ -68,21 +95,25 @@ function App() {
     void invoke<WorkSettings>('work_settings').then(setSettings).catch(() => setError('Не удалось загрузить параметры работы'));
   }, [tab]);
   useEffect(() => {
-    if (!native || tab !== 0) return;
+    if (!native) return;
     let active = true;
-    let checking = false;
-    const refresh = () => {
-      if (checking) return;
-      checking = true;
-      void invoke<InstalledApps>('installed_desktop_apps')
-      .then(result => { if (active) setInstalled(result); })
-        .catch(e => { if (active) setError(String(e)); }).finally(() => { checking = false; });
-    };
+    const refresh = () => { if (active) void refreshClients().catch(() => {}); };
+    const onChanged = listen('desktop-clients-changed', () => {
+      void Promise.resolve(clientCheck.current).catch(() => {}).then(refresh);
+    });
     refresh();
-    const id = window.setInterval(refresh, 8000);
+    const retry = window.setTimeout(refresh, 150);
+    const poll = window.setInterval(refresh, 8000);
     window.addEventListener('focus', refresh);
-    return () => { active = false; window.clearInterval(id); window.removeEventListener('focus', refresh); };
-  }, [tab,connection.port,connection.system_proxy]);
+    return () => {
+      active = false;
+      window.clearTimeout(retry);
+      window.clearInterval(poll);
+      window.removeEventListener('focus', refresh);
+      void onChanged.then(unlisten => unlisten()).catch(() => {});
+    };
+  }, []);
+  useEffect(() => { if (native) void refreshClients().catch(() => {}); }, [connection.port,connection.system_proxy]);
   useEffect(() => {
     if (!native) return;
     invoke<Account>('account').then(setAccount).catch(() => {}).finally(() => setLoading(false));
@@ -90,12 +121,23 @@ function App() {
   }, []);
   useEffect(() => {
     if (!native || !account) return;
-    const id = window.setInterval(() => {
-      invoke<Connection>('tunnel_status').then(setConnection).catch(() => {});
-      if (account.profile.state === 'pending') invoke<Account>('account').then(setAccount).catch(() => {});
+    let active = true;
+    let checking = false;
+    const id = window.setInterval(async () => {
+      if (checking || workLock.current || connecting.current) return;
+      checking = true;
+      try {
+        const route = await invoke<Connection>('tunnel_status');
+        if (active && !workLock.current && !connecting.current) setConnection(route);
+        if (active && account.profile.state === 'pending') {
+          const updated = await invoke<Account>('account');
+          if (active && !workLock.current) setAccount(updated);
+        }
+      } catch { /* A later poll retries transient errors. */ }
+      finally { checking = false; }
     }, 2200);
-    return () => window.clearInterval(id);
-  }, [account]);
+    return () => { active = false; window.clearInterval(id); };
+  }, [!!account,account?.profile.state]);
   useEffect(() => {
     setOutbound(null);
     setObserved(null);
@@ -119,7 +161,11 @@ function App() {
     try { await action(); } catch(e) { setError(String(e)); } finally { workLock.current = false; setBusy(false); }
   }
   async function ensureRoute() {
-    if (!connection.port) setConnection(await invoke<Connection>('connect_tunnel'));
+    if (connection.port) return;
+    if (!connecting.current) {
+      connecting.current = invoke<Connection>('connect_tunnel').finally(() => { connecting.current = null; });
+    }
+    setConnection(await connecting.current);
   }
   const open = (destination:string) => perform(async () => {
     await ensureRoute();
@@ -127,12 +173,23 @@ function App() {
     setProfileState('open');
   });
   const official = (page:string) => perform(() => invoke('open_official',{page}));
-  const launchClient = (client:DesktopClient, restart:boolean) => perform(async () => {
-    await ensureRoute();
-    setConnection(await invoke<Connection>('launch_desktop_app',{client,restart}));
-    setInstalled(await invoke<InstalledApps>('installed_desktop_apps'));
-    setMessage('Клиент запущен через рабочий маршрут');
-  });
+  async function launchClient(client:DesktopClient, restart:boolean) {
+    if (launchLocks.current.has(client)) return;
+    launchLocks.current.add(client);
+    setLaunching(previous => ({...previous, [client]:true}));
+    setError('');
+    setMessage('');
+    try {
+      await ensureRoute();
+      setConnection(await invoke<Connection>('launch_desktop_app',{client,restart}));
+      setMessage('Клиент запущен через рабочий маршрут');
+    } catch(e) { setError(String(e)); }
+    finally {
+      launchLocks.current.delete(client);
+      setLaunching(previous => ({...previous, [client]:false}));
+      void Promise.resolve(clientCheck.current).catch(() => {}).then(refreshClients).catch(() => {});
+    }
+  }
   async function copy(text:string, key = '') {
     try { await navigator.clipboard.writeText(text); setCopied(key); if (!key) setMessage('Скопировано ✓'); }
     catch { setError('Буфер обмена недоступен. Выделите текст вручную.'); }
@@ -268,13 +325,14 @@ function App() {
               const label = app ? [app.variant,desktopLabel(app)].filter(Boolean).join(' · ') : installed ? 'Статус недоступен' : 'Проверяем установку…';
               return <Card key={client} title={name + ' Desktop'} icon={client} description={label}>
                 {app && !app.installed && <button className="launch-button" disabled={busy} onClick={()=>void official(client)}>Скачать клиент</button>}
-                {app?.installed && <button className="launch-button" disabled={busy} onClick={()=>{
+                {app?.installed && <button className="launch-button" disabled={busy || launching[client]} aria-busy={!!launching[client]} onClick={()=>{
                   if (app.can_launch) void launchClient(client,app.running);
                   else setError('Клиент найден, но Windows или macOS не вернула ярлык запуска. Откройте приложение из системного меню и повторите проверку.');
-                }}>{app.running?'Перезапустить через маршрут':'Запустить через маршрут'}</button>}
+                }}>{launching[client] && <span className="launch-spinner" aria-hidden="true"/>}{app.running?'Перезапустить через маршрут':'Запустить через маршрут'}</button>}
               </Card>;
             })}
           </div>
+          <button className="quiet refresh-clients" disabled={refreshingClients} onClick={()=>void rediscoverClients()}>Обновить список приложений</button>
           {resetRegion && resetRegion === profileRegion && <section className="panel profile-confirm" aria-label="Подтвердить очистку профиля">
             <p>Удалить данные рабочего профиля для {resetRegion.toUpperCase()}? Сначала закройте его окно.</p>
             <div className="actions"><button disabled={busy} onClick={()=>void perform(async()=>{

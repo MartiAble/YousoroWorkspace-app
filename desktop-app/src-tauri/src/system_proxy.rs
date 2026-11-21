@@ -31,53 +31,49 @@ fn restore_value(current: &Option<String>, expected: &Option<String>, before: &O
     if current == expected { before.clone() } else { current.clone() }
 }
 
-const KEY: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Internet Settings', $env:WORKSPACE_PROXY_WRITE -eq 'yes')
-if (!$key) { throw 'Internet Settings unavailable' }
-"#;
+#[cfg(windows)]
+const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 
 fn read_settings() -> Result<Settings, String> {
-    let script = format!(r#"{KEY}
-@{{ enable = $key.GetValue('ProxyEnable'); server = $key.GetValue('ProxyServer', $null, 'DoNotExpandEnvironmentNames');
-    bypass = $key.GetValue('ProxyOverride', $null, 'DoNotExpandEnvironmentNames');
-    pac = $key.GetValue('AutoConfigURL', $null, 'DoNotExpandEnvironmentNames') }} | ConvertTo-Json -Compress
-"#);
-    let output = crate::launch::powershell(&script).env_remove("WORKSPACE_PROXY_WRITE")
-        .output().map_err(|_| "Не удалось прочитать системный прокси")?;
-    if !output.status.success() { return Err("Не удалось прочитать системный прокси".into()); }
-    serde_json::from_slice(&output.stdout).map_err(|_| "Не удалось разобрать настройки системного прокси".into())
+    #[cfg(windows)]
+    {
+        let read = || -> std::io::Result<Settings> {
+            let key = crate::native_windows::Key::user(KEY, false)?;
+            Ok(Settings {
+                enable: key.dword("ProxyEnable")?,
+                server: key.string("ProxyServer")?,
+                bypass: key.string("ProxyOverride")?,
+                pac: key.string("AutoConfigURL")?,
+            })
+        };
+        read().map_err(|_| "Не удалось прочитать системный прокси".into())
+    }
+    #[cfg(not(windows))]
+    Err("Управление системным прокси доступно в Windows".into())
 }
 
 fn write_settings(current: &Settings, settings: &Settings) -> Result<(), String> {
-    let script = format!(r#"{KEY}
-$settings = $env:WORKSPACE_PROXY_DATA | ConvertFrom-Json
-$changes = $env:WORKSPACE_PROXY_FIELDS -split ","
-foreach ($entry in @(
-    @('ProxyServer', $settings.server, 'String'),
-    @('ProxyOverride', $settings.bypass, 'String'),
-    @('AutoConfigURL', $settings.pac, 'String'),
-    @('ProxyEnable', $settings.enable, 'DWord')
-)) {{
-    if ($changes -notcontains $entry[0]) {{ continue }}
-    if ($null -eq $entry[1]) {{ $key.DeleteValue($entry[0], $false) }}
-    else {{ $key.SetValue($entry[0], $entry[1], $entry[2]) }}
-}}
-"#);
-    let changes = [
-        (current.enable != settings.enable, "ProxyEnable"),
-        (current.server != settings.server, "ProxyServer"),
-        (current.bypass != settings.bypass, "ProxyOverride"),
-        (current.pac != settings.pac, "AutoConfigURL"),
-    ].into_iter().filter_map(|(changed, name)| changed.then_some(name)).collect::<Vec<_>>();
-    if changes.is_empty() { return Ok(()); }
-    let data = serde_json::to_string(settings).map_err(|_| "Не удалось подготовить настройки системного прокси")?;
-    let output = crate::launch::powershell(&script).env("WORKSPACE_PROXY_WRITE", "yes")
-        .env("WORKSPACE_PROXY_DATA", data).env("WORKSPACE_PROXY_FIELDS", changes.join(",")).output().map_err(|_| "Не удалось изменить системный прокси")?;
-    refresh();
-    if !output.status.success() { return Err("Не удалось изменить системный прокси Windows".into()); }
-    Ok(())
+    #[cfg(windows)]
+    {
+        if current == settings { return Ok(()); }
+        let write = || -> std::io::Result<()> {
+            let key = crate::native_windows::Key::user(KEY, true)?;
+            for (name, before, after) in [
+                ("ProxyServer", &current.server, &settings.server),
+                ("ProxyOverride", &current.bypass, &settings.bypass),
+                ("AutoConfigURL", &current.pac, &settings.pac),
+            ] {
+                if before != after { key.set_string(name, after.as_deref())?; }
+            }
+            if current.enable != settings.enable { key.set_dword("ProxyEnable", settings.enable)?; }
+            Ok(())
+        };
+        let result = write();
+        refresh();
+        result.map_err(|_| "Не удалось изменить системный прокси Windows".into())
+    }
+    #[cfg(not(windows))]
+    { let _ = (current, settings); Err("Управление системным прокси доступно в Windows".into()) }
 }
 
 #[cfg(windows)]
@@ -93,9 +89,6 @@ fn refresh() {
     }
 }
 
-#[cfg(not(windows))]
-fn refresh() {}
-
 #[derive(Serialize, Deserialize)]
 struct Journal {
     before: Settings,
@@ -110,6 +103,8 @@ pub struct Lease {
 }
 
 impl Lease {
+    pub fn url(&self) -> Option<&str> { self.server.as_ref().map(|server| server.url.as_str()) }
+
     fn lock(directory: &Path) -> Result<Self, String> {
         fs::create_dir_all(directory).map_err(|_| "Нет каталога настроек системного прокси")?;
         let lock = OpenOptions::new().write(true).create(true).truncate(false)
@@ -170,10 +165,8 @@ impl Drop for Lease {
     }
 }
 
-pub fn active(lease: Option<&Lease>) -> bool {
-    lease.and_then(|lease| lease.server.as_ref()).is_some_and(|server| {
-        read_settings().is_ok_and(|settings| settings.enable.unwrap_or(0) == 0 && settings.pac.as_deref() == Some(server.url.as_str()))
-    })
+pub fn active(url: Option<&str>) -> bool {
+    url.is_some_and(|url| read_settings().is_ok_and(|settings| settings.enable.unwrap_or(0) == 0 && settings.pac.as_deref() == Some(url)))
 }
 
 const PAC: &str = r#"

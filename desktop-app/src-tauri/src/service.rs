@@ -3,7 +3,7 @@ use reqwest::{blocking::{Client, RequestBuilder, Response}, header};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::{Cursor, Read}, process::Command, time::Duration};
+use std::{io::{Cursor, Read}, time::Duration};
 
 pub const ORIGIN: &str = env!("DESKTOP_API_ORIGIN");
 pub const DIAGNOSTICS_ORIGIN: &str = env!("DESKTOP_DIAGNOSTICS_ORIGIN");
@@ -32,7 +32,7 @@ pub struct NodeEnvironment {
 }
 
 pub fn client() -> Result<Client, String> {
-    Client::builder().no_proxy().timeout(Duration::from_secs(25))
+    Client::builder().no_proxy().connect_timeout(Duration::from_secs(5)).timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none()).build().map_err(|_| "Не удалось настроить клиент HTTPS".into())
 }
 pub fn checked(result: Result<Response, reqwest::Error>) -> Result<Response, String> {
@@ -75,25 +75,25 @@ pub fn is_token(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 fn fingerprint() -> Result<String, String> {
-    let mut cmd;
-    if cfg!(target_os = "macos") {
-        cmd = Command::new("/usr/sbin/ioreg");
-        cmd.args(["-rd1", "-c", "IOPlatformExpertDevice"]);
-    } else if cfg!(target_os = "windows") {
-        cmd = Command::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value"]);
-    } else { return Err("Эта система пока не поддерживается".into()); }
-    let result = cmd.output().map_err(|_| "Не удалось определить идентификатор компьютера")?;
-    let raw = String::from_utf8_lossy(&result.stdout);
-    let os_id = if cfg!(target_os = "macos") {
-        raw.lines().find(|line| line.contains("\"IOPlatformUUID\"")).and_then(|line| line.split('"').nth(3)).unwrap_or("")
-    } else { raw.trim() };
-    let mac_uid = if cfg!(target_os = "macos") {
+    #[cfg(not(windows))]
+    use std::process::Command;
+    #[cfg(windows)]
+    let (os_id, mac_uid) = (
+        crate::native_windows::machine_user_id().map_err(|_| "Не удалось определить идентификатор компьютера")?,
+        String::new(),
+    );
+    #[cfg(not(windows))]
+    let (os_id, mac_uid) = {
+        if !cfg!(target_os = "macos") { return Err("Эта система пока не поддерживается".into()); }
+        let result = Command::new("/usr/sbin/ioreg").args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output().map_err(|_| "Не удалось определить идентификатор компьютера")?;
+        let raw = String::from_utf8_lossy(&result.stdout);
+        let os_id = raw.lines().find(|line| line.contains("\"IOPlatformUUID\"")).and_then(|line| line.split('"').nth(3)).unwrap_or("");
+        if !result.status.success() || os_id.is_empty() { return Err("Не удалось определить идентификатор компьютера".into()); }
         let id = Command::new("/usr/bin/id").arg("-u").output().map_err(|_| "Не удалось прочитать UID пользователя")?;
         if !id.status.success() { return Err("Не удалось прочитать UID пользователя".into()); }
-        String::from_utf8_lossy(&id.stdout).trim().to_owned()
-    } else { String::new() };
-    if !result.status.success() || os_id.is_empty() { return Err("Не удалось определить идентификатор компьютера".into()); }
+        (os_id.to_owned(), String::from_utf8_lossy(&id.stdout).trim().to_owned())
+    };
     Ok(format!("{:x}", Sha256::digest(format!("yousoro-workspace-native-v1:{os_id}:{mac_uid}"))))
 }
 fn enrollment(s: &Session, os: &str) -> Result<String, String> {

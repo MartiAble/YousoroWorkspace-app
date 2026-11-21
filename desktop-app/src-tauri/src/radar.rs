@@ -103,6 +103,7 @@ fn geoip(ip: Ipv4Addr) -> Option<Geo> {
 pub struct BrowserObservation {
     timezone: String,
     language: String,
+    timezone_matches: Option<bool>,
 }
 
 #[derive(Default, Clone)]
@@ -114,7 +115,7 @@ pub struct ProbeEndpoint {
 }
 
 impl BrowserProbe {
-    pub fn start(&self, port: u16, region: &str, destination: &str) -> std::io::Result<ProbeEndpoint> {
+    pub fn start(&self, port: u16, region: &str, destination: &str, timezone: Option<&str>) -> std::io::Result<ProbeEndpoint> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let local = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -124,13 +125,30 @@ impl BrowserProbe {
         let host = format!("127.0.0.1:{local}");
         let url = format!("http://{host}{path}");
         let redirect = serde_json::to_string(destination).unwrap_or_else(|_| "\"about:blank\"".into());
+        let expected = serde_json::to_string(&timezone).unwrap_or_else(|_| "null".into());
         let html = format!(r#"<!doctype html><meta charset="utf-8"><title>Yousoro Workspace</title>
 <script>
 const next = {redirect};
+const expected = {expected};
+const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+let matches = null;
+if (expected) {{
+  try {{
+    const clock = new Intl.DateTimeFormat('en', {{timeZone: expected, timeZoneName:'longOffset'}});
+    const year = new Date().getUTCFullYear();
+    matches = timezone === clock.resolvedOptions().timeZone && [0, 6].every(month => {{
+      const date = new Date(Date.UTC(year,month,15,12));
+      const label = clock.formatToParts(date).find(part => part.type === 'timeZoneName').value;
+      const [, sign, hour, minute] = /GMT([+-])([0-9]{{2}}):([0-9]{{2}})/.exec(label) || [];
+      const offset = sign ? (sign === '+' ? -1 : 1) * (+hour * 60 + +minute) : 0;
+      return date.getTimezoneOffset() === offset;
+    }});
+  }} catch {{}}
+}}
 const go = () => location.replace(next);
 setTimeout(go, 1500);
 fetch(location.pathname, {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{
-  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, language: navigator.language
+  timezone, language: navigator.language, timezone_matches: matches
 }})}}).finally(go);
 </script><p>Открываем рабочую страницу…</p>"#);
         let region = region.to_owned();
@@ -209,8 +227,8 @@ fn probe_request(mut stream: TcpStream, path: &str, host: &str, html: &str) -> s
 #[derive(Serialize)]
 struct Browser {
     running: Option<bool>,
-    expected_timezone: &'static str,
-    expected_language: &'static str,
+    expected_timezone: Option<String>,
+    expected_language: Option<String>,
     actual: Option<BrowserObservation>,
     launch_language: Option<String>,
     geolocation_blocked: Option<bool>,
@@ -240,8 +258,27 @@ fn device_slots(bound: &service::Devices, device_id: Option<&str>) -> DeviceSlot
 
 #[derive(Serialize)]
 struct HttpsTargets {
-    claude: bool,
-    chatgpt: bool,
+    claude: HttpsCheck,
+    chatgpt: HttpsCheck,
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum HttpsState { Available, Restricted, Unavailable }
+
+#[derive(Serialize)]
+struct HttpsCheck {
+    state: HttpsState,
+    status: Option<u16>,
+}
+
+fn classify_https(status: Option<u16>) -> HttpsCheck {
+    let state = match status {
+        Some(200..=399) => HttpsState::Available,
+        Some(401 | 403 | 429) => HttpsState::Restricted,
+        _ => HttpsState::Unavailable,
+    };
+    HttpsCheck { state, status }
 }
 
 #[derive(Serialize)]
@@ -272,26 +309,13 @@ fn system_timezone() -> Option<String> {
     link.to_str()?.split_once("zoneinfo/").map(|(_, zone)| zone.to_owned())
 }
 
-fn https_available(client: &reqwest::blocking::Client, url: &str) -> bool {
-    client.head(url).send().is_ok_and(|response| !response.status().is_server_error())
-}
-
-fn timezone_matches(region: &str, actual: &str, expected: &str) -> bool {
-    if actual.eq_ignore_ascii_case(expected) { return true; }
-    let windows = match region.to_ascii_uppercase().as_str() {
-        "DE" | "NL" => "W. Europe Standard Time",
-        "GB" => "GMT Standard Time",
-        "US" => "Eastern Standard Time",
-        "TR" => "Turkey Standard Time",
-        "KZ" => "West Asia Standard Time",
-        _ => "UTC",
-    };
-    cfg!(windows) && actual.eq_ignore_ascii_case(windows)
+fn https_probe(client: &reqwest::blocking::Client, url: &str) -> HttpsCheck {
+    classify_https(client.head(url).send().ok().map(|response| response.status().as_u16()))
 }
 
 pub fn report(
     port: u16, region: &str, app_data: &Path, probe: &BrowserProbe, lookup_geo: bool,
-    check_dns: bool, device_id: Option<&str>, progress: impl Fn(&'static str),
+    check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, progress: impl Fn(&'static str),
 ) -> Report {
     progress("network");
     let session = service::Session::restore().ok();
@@ -302,9 +326,9 @@ pub fn report(
             let result = reconcile(observation, gateway);
             progress("services");
             let (claude, chatgpt) = std::thread::scope(|scope| {
-                let claude = scope.spawn(|| https_available(&client, "https://claude.ai/"));
-                let chatgpt = scope.spawn(|| https_available(&client, "https://chatgpt.com/"));
-                (claude.join().unwrap_or(false), chatgpt.join().unwrap_or(false))
+                let claude = scope.spawn(|| https_probe(&client, "https://claude.ai/"));
+                let chatgpt = scope.spawn(|| https_probe(&client, "https://chatgpt.com/"));
+                (claude.join().unwrap_or_else(|_| classify_https(None)), chatgpt.join().unwrap_or_else(|_| classify_https(None)))
             });
             let https = Some(HttpsTargets { claude, chatgpt });
             match result {
@@ -319,7 +343,8 @@ pub fn report(
     };
 
     progress("profile");
-    let (expected_timezone, expected_language) = launch::regional_settings(region);
+    let expected_timezone = environment.map(|node| node.timezone.clone());
+    let expected_language = environment.map(|node| node.locale.clone());
     let profile = launch::profile_path(app_data, region).ok();
     let process = profile.as_ref().and_then(|path| launch::browser_process(path).ok());
     let running = process.as_ref().map(Option::is_some);
@@ -343,14 +368,16 @@ pub fn report(
     let apps = apps::installed_apps(Some(port), system_proxy == Some(true));
 
     let timezone = system_timezone();
-    let timezone_matches = timezone.as_deref().map(|actual| timezone_matches(region, actual, expected_timezone));
+    let timezone_matches = timezone.as_deref().zip(environment).map(|(actual, expected)| {
+        actual.eq_ignore_ascii_case(if cfg!(windows) { &expected.windows_timezone } else { &expected.timezone })
+    });
     let devices = session.as_ref().and_then(|session| service::account(session).ok())
         .map(|account| device_slots(&account.bound, device_id));
     let checks = [
         (network.is_some(), "Проверьте, что туннель подключён и сервер диагностики доступен."),
-        (https.as_ref().is_some_and(|target| target.claude && target.chatgpt), "Повторите HTTPS-проверку после переподключения."),
+        (https.as_ref().is_some_and(|target| target.claude.state == HttpsState::Available && target.chatgpt.state == HttpsState::Available), "Повторите HTTPS-проверку после переподключения."),
         (matched == Some(true), "Подождите, пока регион применится, затем переподключите туннель и повторите сверку узла."),
-        (browser.actual.as_ref().is_some_and(|data| data.timezone == expected_timezone && data.language.eq_ignore_ascii_case(expected_language)),
+        (browser.actual.as_ref().is_some_and(|data| data.timezone_matches == Some(true) && browser.expected_language.as_deref().is_some_and(|locale| data.language.eq_ignore_ascii_case(locale))),
             "Перезапустите рабочий браузер из Workspace. Если Windows сохраняет системный часовой пояс, сравните его с регионом."),
         (geolocation_blocked == Some(true), "Проверьте запрет геолокации в настройках рабочего профиля."),
         (webrtc_protected == Some(true), "Откройте браузер через Workspace, чтобы применить ограничение WebRTC."),
@@ -388,6 +415,20 @@ pub fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separates_service_restrictions_from_success_and_failure() {
+        for status in [200, 204, 302] {
+            assert_eq!(classify_https(Some(status)).state, HttpsState::Available);
+        }
+        for status in [403, 429] {
+            let result = classify_https(Some(status));
+            assert_eq!(result.state, HttpsState::Restricted);
+            assert_eq!(result.status, Some(status));
+        }
+        assert_eq!(classify_https(Some(503)).state, HttpsState::Unavailable);
+        assert_eq!(classify_https(None).state, HttpsState::Unavailable);
+    }
 
     #[test]
     fn rejects_loopback_and_private_gateway_addresses() {
@@ -439,7 +480,7 @@ mod tests {
         let report = Report {
             network: Some(Observation { ip: "8.8.8.8".parse().unwrap(), latency_ms: 123 }),
             network_error: None, matched: Some(false), geo: None, dns: None, devices: None,
-            browser: Browser { running: Some(true), expected_timezone: "Europe/Berlin", expected_language: "de-DE",
+            browser: Browser { running: Some(true), expected_timezone: Some("Europe/Berlin".into()), expected_language: Some("de-DE".into()),
                 actual: None, launch_language: Some("de-DE".into()), geolocation_blocked: Some(false), webrtc_protected: None },
             timezone: None, timezone_matches: None, https: None, system_proxy: Some(false),
             apps: apps::InstalledApps { claude: None, chatgpt: None }, ready: 1, total: 5, hints: vec!["hint"],

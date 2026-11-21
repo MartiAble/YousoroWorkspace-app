@@ -2,19 +2,20 @@ export type DesktopClient = 'claude' | 'chatgpt';
 export type DesktopStatus = { installed: boolean; can_launch: boolean; variant?: string|null; running: boolean; store: boolean; proxy: 'arguments' | 'system' | 'unknown' };
 export type InstalledApps = Record<DesktopClient, DesktopStatus | null>;
 export type Observation = { ip: string; latency_ms: number };
+type ServiceProbe = { state: 'available' | 'restricted' | 'unavailable'; status: number | null };
 export type RadarReport = {
   network: Observation | null; network_error: string | null; matched: boolean | null;
   geo: { country: string | null; country_code?: string | null; city: string | null; connection: { isp: string | null; asn: number | null } | null } | null;
   browser: {
-    running: boolean | null; expected_timezone: string; expected_language: string;
-    actual: { timezone: string; language: string } | null; launch_language: string | null;
+    running: boolean | null; expected_timezone: string | null; expected_language: string | null;
+    actual: { timezone: string; language: string; timezone_matches: boolean | null } | null; launch_language: string | null;
     geolocation_blocked: boolean | null; webrtc_protected: boolean | null;
   };
   dns: { status: 'distinct' | 'overlap' | 'unavailable'; tunnel_resolvers: number; system_resolvers: number } | null;
   devices: { used: number; limit: number; desktop: number; mobile: number; current_pc: boolean | null } | null;
   timezone: string | null; timezone_matches: boolean | null;
   system_proxy: boolean | null; apps: InstalledApps;
-  https: { claude: boolean; chatgpt: boolean } | null;
+  https: Record<DesktopClient, ServiceProbe> | null;
   ready: number; total: number;
 };
 
@@ -83,14 +84,17 @@ export function Radar(props: Props) {
   const browser = report?.browser;
   const service = report?.https;
   const mismatch = report?.timezone_matches === false;
-  const browserMismatch = !!browser?.actual && browser.actual.timezone !== browser.expected_timezone;
+  const browserMismatch = browser?.actual?.timezone_matches === false;
+  const localeMismatch = !!browser?.expected_language && !!browser.actual && browser.actual.language.toLowerCase() !== browser.expected_language.toLowerCase();
   const missingProtection = browser?.geolocation_blocked === false || browser?.webrtc_protected === false;
   const inspected = clients.find(key => report?.apps[key]?.running && report.apps[key]?.proxy === 'unknown');
   const reconnect = { label: connected ? 'Переподключить' : 'Подключить маршрут', run:props.connect };
   const timeAction = { label:'Открыть настройки времени', run:props.time };
-  const serviceMiss = !!service && (!service.claude || !service.chatgpt);
+  const limited = service ? clients.filter(key => service[key].state === 'restricted').map(key => clientNames[key]) : [];
+  const unreachable = service ? clients.filter(key => service[key].state === 'unavailable').map(key => clientNames[key]) : [];
+  const serviceMiss = unreachable.length > 0;
   const critical = !connected || !!report && (!network || serviceMiss);
-  const advisory = !!report && (report.matched !== true || !service || missingProtection || mismatch || browserMismatch || !!inspected);
+  const advisory = !!report && (report.matched !== true || !service || missingProtection || mismatch || browserMismatch || localeMismatch || limited.length > 0 || !!inspected);
   const verdict: Tone = critical ? 'error' : !report ? 'idle' : advisory ? 'warning' : 'ok';
   const rows: Row[] = [
     {
@@ -99,20 +103,22 @@ export function Radar(props: Props) {
       text: !connected ? 'Рабочий маршрут отключён' : !network ? report ? 'Не удалось получить внешний IP' : 'Проверка внешнего IP ещё не завершена' :
         report?.matched === false ? 'Внешний IP отличается от адреса выбранного узла' : report?.matched === null ?
           'Внешний IP получен. Сверка с выбранным узлом недоступна' :
-          'Маршрут активен' + (location ? ' · ' + location : '') + ' (' + network.ip + ')',
+          (report?.matched ? 'Узел подтверждён для пробы IPv4' : 'Получен внешний IPv4') + ' (' + network.ip + ')',
       action: !connected || report && (!network || report.matched === false) ? reconnect : undefined,
     },
     {
       title:'Доступность сервисов',
-      tone: serviceMiss ? 'error' : service ? 'ok' : 'idle',
-      text: !service ? 'Доступность ещё не проверена' : !service.claude && !service.chatgpt ? 'Нет ответа от Claude и ChatGPT' :
-        !service.claude ? 'Нет ответа от Claude. ChatGPT отвечает' : !service.chatgpt ? 'Нет ответа от ChatGPT. Claude отвечает' : 'Claude и ChatGPT отвечают',
+      tone: serviceMiss ? 'error' : limited.length ? 'warning' : service ? 'ok' : 'idle',
+      text: !service ? 'Доступность ещё не проверена' : [
+        unreachable.length ? 'Не удалось подключиться: ' + unreachable.join(', ') : '',
+        limited.length ? limited.join(', ') + ' ограничил запрос с этого узла. Попробуйте сменить регион' : '',
+      ].filter(Boolean).join('. ') || 'Claude и ChatGPT отвечают на проверку',
       action: serviceMiss ? reconnect : undefined,
     },
     {
       title:'Защита браузера',
-      tone: missingProtection ? 'warning' : browser ? 'ok' : 'idle',
-      text: missingProtection ? 'Параметры защиты рабочего профиля требуют настройки' :
+      tone: missingProtection || localeMismatch ? 'warning' : browser?.running === false || browser?.geolocation_blocked && browser.webrtc_protected ? 'ok' : 'idle',
+      text: missingProtection ? 'Параметры защиты рабочего профиля требуют настройки' : localeMismatch ? 'Язык рабочего браузера отличается от настройки узла' :
         browser?.running === false ? 'Рабочий браузер готов к запуску' :
         browser?.geolocation_blocked && browser.webrtc_protected ? 'Доступ к геолокации и локальному адресу ограничен' : 'Защита проверяется в рабочем браузере',
       action: missingProtection && !browser?.running ? {label:'Восстановить защиту',run:props.repair} : undefined,
@@ -133,8 +139,11 @@ export function Radar(props: Props) {
     },
   ];
   const details: Array<[string,string]> = report ? [
+    ['IPv4', report.matched === true ? 'Маршрут подтверждён для этой пробы' : report.network ? 'Адрес получен, маршрут не подтверждён' : 'Не проверено'],
+    ['IPv6', 'Не проверено'],
+    ['HTTPS', service ? clients.map(key => clientNames[key] + ' · ' + (service[key].status ?? 'нет HTTP-ответа')).join(' / ') : 'Не проверено'],
     ['Провайдер / ASN', [report.geo?.connection?.isp, report.geo?.connection?.asn && 'AS' + report.geo.connection.asn].filter(Boolean).join(' · ') || 'Нет данных'],
-    ['DNS-проба', report.dns ? (report.dns.status === 'distinct' ? 'Разные резолверы' : report.dns.status === 'overlap' ? 'Есть совпадения' : 'Нет ответа от сервиса проверки') +
+    ['DNS-проба', report.dns ? (report.dns.status === 'distinct' ? 'Разные резолверы в этой пробе' : report.dns.status === 'overlap' ? 'Есть совпадения' : 'Не проверено: нет ответа от сервиса сравнения') +
       ' · SOCKS5 ' + report.dns.tunnel_resolvers + ' / ОС ' + report.dns.system_resolvers : 'Не запрашивалась'],
     ['WebRTC', browser?.webrtc_protected === true ? 'disable_non_proxied_udp' : browser?.webrtc_protected === false ? 'Ограничение выключено' : 'Нет данных'],
     ['Язык браузера', [browser?.actual?.language || browser?.expected_language, browser?.launch_language && '--lang=' + browser.launch_language].filter(Boolean).join(' · ') || 'Нет данных'],

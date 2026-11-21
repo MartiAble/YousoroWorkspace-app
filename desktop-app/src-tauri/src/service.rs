@@ -18,7 +18,18 @@ pub struct Devices { pub limit: u64, pub items: Vec<Device> }
 #[derive(Serialize, Deserialize)]
 pub struct Device { pub id: String, pub name: String, pub os: String }
 #[derive(Serialize, Deserialize)]
-pub struct Profile { pub requested: Option<String>, pub applied: Option<String>, pub state: String }
+pub struct Profile {
+    pub requested: Option<String>,
+    pub applied: Option<String>,
+    pub state: String,
+    pub node_environment: Option<NodeEnvironment>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NodeEnvironment {
+    pub timezone: String,
+    pub windows_timezone: String,
+    pub locale: String,
+}
 
 pub fn client() -> Result<Client, String> {
     Client::builder().no_proxy().timeout(Duration::from_secs(25))

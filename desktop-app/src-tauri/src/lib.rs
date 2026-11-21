@@ -20,6 +20,7 @@ struct Connection {
     tunnel: Tunnel,
     device_id: Option<String>,
     started: std::time::Instant,
+    environment: Option<service::NodeEnvironment>,
 }
 
 impl Connection {
@@ -129,7 +130,7 @@ async fn connect_tunnel(app: AppHandle) -> Result<Status,String> { blocking(move
         let executable_dir = executable.parent().ok_or("Нет каталога приложения")?;
         let enrollment = service::bootstrap(&s, &account)?;
         let tunnel = tunnel::start(executable_dir, &path, enrollment.config, region)?;
-        *guard = Some(Connection { tunnel, proxy: None, device_id: enrollment.device_id, started: std::time::Instant::now() });
+        *guard = Some(Connection { tunnel, proxy: None, device_id: enrollment.device_id, started: std::time::Instant::now(), environment: account.profile.node_environment });
     }
     drop(guard);
     Ok(status(&app))
@@ -147,9 +148,11 @@ async fn run_system_radar(app: AppHandle, lookup_geo: bool, check_dns: Option<bo
         let region = route.region.ok_or("Регион не определён")?;
         let data = app.path().app_data_dir().map_err(|_| "Нет каталога данных приложения")?;
         let state = app.state::<Runtime>();
-        let device_id = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?.as_ref()
-            .filter(|active| active.tunnel.port == port).and_then(|active| active.device_id.clone());
-        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref(),
+        let (device_id, environment) = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?.as_ref()
+            .filter(|active| active.tunnel.port == port)
+            .map(|active| (active.device_id.clone(), active.environment.clone()))
+            .ok_or("Туннель изменился во время диагностики")?;
+        let report = radar::report(port, &region, &data, &state.2, lookup_geo, check_dns.unwrap_or(false), device_id.as_deref(), environment.as_ref(),
             |stage| { let _ = app.emit("radar-progress", stage); });
         if status(&app).port != Some(port) { return Err("Туннель изменился во время диагностики".into()); }
         Ok(report)
@@ -208,11 +211,12 @@ fn launch_browser(app: AppHandle, destination: String) -> Result<(),String> {
     let state = app.state::<Runtime>();
     let _profile_guard = state.1.lock().map_err(|_| "Ошибка состояния профиля")?;
     let mut tunnel = state.0.lock().map_err(|_| "Ошибка состояния туннеля")?;
-    let tunnel = &mut tunnel.as_mut().ok_or("Сначала подключите туннель")?.tunnel;
+    let connection = tunnel.as_mut().ok_or("Сначала подключите туннель")?;
+    let tunnel = &mut connection.tunnel;
     if !tunnel.running() { return Err("Сначала подключите туннель".into()); }
     let data = app.path().app_data_dir().map_err(|_| "Не удалось открыть каталог приложения")?;
     let profile = launch::profile_path(&data, &tunnel.region)?;
-    launch::launch_browser(&profile, tunnel.port, &tunnel.region, url, &state.2)
+    launch::launch_browser(&profile, tunnel.port, &tunnel.region, connection.environment.as_ref(), url, &state.2)
 }
 
 #[tauri::command]

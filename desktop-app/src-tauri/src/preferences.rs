@@ -1,5 +1,5 @@
 use crate::launch::powershell;
-use std::{fs, io, path::{Path, PathBuf}, sync::Mutex};
+use std::{fs, io, path::{Path, PathBuf}};
 
 const STARTUP_VALUE: &str = "YousoroWorkspace";
 
@@ -69,31 +69,4 @@ if ($env:WORKSPACE_STARTUP_ENABLED -eq '1') {
         return Ok(());
     }
     Err("Автозапуск не поддерживается на этой системе".into())
-}
-
-#[derive(Default)]
-pub struct UpdateNotice(Mutex<Option<String>>);
-
-impl UpdateNotice {
-    pub fn show(&self, version: &str, dismiss: bool) -> bool {
-        let Ok(mut dismissed) = self.0.lock() else { return false; };
-        if version.is_empty() { return false; }
-        if dismiss { *dismissed = Some(version.into()); }
-        dismissed.as_deref() != Some(version)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn updater_notice_returns_only_for_a_different_version() {
-        let notice = UpdateNotice::default();
-        assert!(!notice.show("", false));
-        assert!(notice.show("1.2.3", false));
-        assert!(!notice.show("1.2.3", true));
-        assert!(!notice.show("1.2.3", false));
-        assert!(notice.show("1.2.4", false));
-    }
 }

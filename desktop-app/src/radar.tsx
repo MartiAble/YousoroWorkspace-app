@@ -7,6 +7,7 @@ export type BrowserProbeReport = {
   language: string; languages: string[]; accept_language: string; webdriver: boolean | null;
   geolocation: 'denied' | 'granted' | 'prompt' | 'unknown';
   ice: 'match' | 'mismatch' | 'local' | 'unknown'; stun: boolean;
+  local_ip?: 'clear' | 'exposed' | 'unknown'; media?: 'working' | 'denied' | 'not_tested';
 };
 
 type ServiceProbe = { state: 'available' | 'restricted' | 'unavailable'; status: number | null };
@@ -55,7 +56,7 @@ type Props = {
   connected: boolean; busy: boolean;
   browserReport: BrowserProbeReport | null; scanBrowser: () => void; stun: boolean; setStun: (enabled: boolean) => void;
   scan: () => void; connect: () => void; repair: () => void; time: () => void;
-  client: (client: DesktopClient) => void; copy: (text: string) => void;
+  client: (client: DesktopClient, usePac?: boolean) => void; copy: (text: string) => void;
 };
 const clientNames = { claude: 'Claude', chatgpt: 'ChatGPT' };
 const clients = ['claude','chatgpt'] as const;
@@ -97,18 +98,21 @@ export function Radar(props: Props) {
   const localeMismatch = !!browser?.expected_language && !!language && language.toLowerCase() !== browser.expected_language.toLowerCase();
   const addressMismatch = !!measured?.observed_ip && !!network && measured.observed_ip !== network.ip;
   const differentWebRtcAddress = measured?.ice === 'mismatch';
+  const localExposed = measured?.local_ip === 'exposed';
+  const localProtected = browser?.webrtc_protected === true && measured?.local_ip === 'clear';
   const locationAllowed = measured?.geolocation === 'granted';
   const browserIpConfirmed = !!measured?.observed_ip && measured.observed_ip === network?.ip;
   const privacyConfigured = browser?.geolocation_blocked === true && browser?.webrtc_protected === true;
   const missingProtection = browser?.geolocation_blocked === false || browser?.webrtc_protected === false;
   const inspected = clients.find(key => report?.apps[key]?.running && report.apps[key]?.proxy === 'unknown');
+  const offerPac = inspected === 'chatgpt' && report?.apps.chatgpt?.store && !report.system_proxy;
   const reconnect = { label: connected ? 'Переподключить' : 'Подключить маршрут', run:props.connect };
   const timeAction = { label:'Открыть настройки времени', run:props.time };
   const limited = service ? clients.filter(key => service[key].state === 'restricted').map(key => clientNames[key]) : [];
   const unreachable = service ? clients.filter(key => service[key].state === 'unavailable').map(key => clientNames[key]) : [];
   const serviceMiss = unreachable.length > 0;
   const critical = !connected || !!report && (!network || serviceMiss || addressMismatch || differentWebRtcAddress);
-  const advisory = !!report && (report.matched !== true || !service || missingProtection || mismatch || browserMismatch || localeMismatch || locationAllowed || measured?.webdriver === true || limited.length > 0 || !!inspected);
+  const advisory = !!report && (report.matched !== true || !service || missingProtection || localExposed || mismatch || browserMismatch || localeMismatch || locationAllowed || measured?.webdriver === true || limited.length > 0 || !!inspected);
   const verdict: Tone = critical ? 'error' : !report ? 'idle' : advisory ? 'warning' : 'ok';
   const rows: Row[] = [
     {
@@ -131,10 +135,11 @@ export function Radar(props: Props) {
     },
     {
       title:'Защита сетевого адреса',
-      tone: differentWebRtcAddress ? 'error' : missingProtection ? 'warning' : browserIpConfirmed && measured?.ice === 'match' ? 'ok' : 'idle',
+      tone: differentWebRtcAddress ? 'error' : missingProtection || localExposed ? 'warning' : localProtected ? 'ok' : 'idle',
       text: differentWebRtcAddress ? 'Браузер сообщил другой публичный адрес. Повторите проверку рабочего маршрута.' :
-        browserIpConfirmed && measured?.ice === 'match' ? 'В этой проверке дополнительных публичных адресов не обнаружено.' :
-        measured ? 'Данные браузера получены. Проверка внешнего адреса в медиасоединениях может быть неполной.' :
+        localExposed ? 'Браузер сообщил локальный IP. Проверьте настройки рабочего профиля.' :
+        localProtected ? 'Утечек локального IP не обнаружено' :
+        measured ? 'Проверка локальных адресов не подтвердила защиту.' :
         privacyConfigured ? 'Настроено в профиле • можно проверить в браузере' : 'Проверьте настройки открытого рабочего браузера.',
       action: missingProtection && !browser?.running ? {label:'Восстановить защиту',run:props.repair} : undefined,
     },
@@ -157,10 +162,14 @@ export function Radar(props: Props) {
     {
       title:'Приложения и изоляция',
       tone: inspected ? 'warning' : report ? 'ok' : 'idle',
-      text: inspected ? clientNames[inspected] + ' открыт. Рабочий маршрут не подтверждён' :
+      text: offerPac ? 'Для Store-версии ChatGPT можно включить точечный маршрут. Обычные сайты продолжат открываться напрямую.' : inspected ? clientNames[inspected] + ' открыт. Рабочий маршрут не подтверждён' :
         report ? clients.some(key => report.apps[key]?.running) ? 'Рабочий маршрут настроен для запущенных клиентов' : 'Лаунчер направляет только рабочий браузер и выбранные приложения' : 'Состояние приложений ещё не проверено',
-      action: inspected && report?.apps[inspected]?.can_launch ? {label:'Перезапустить через маршрут',run:()=>props.client(inspected)} : undefined,
+      action: inspected && report?.apps[inspected]?.can_launch ? {label:offerPac ? 'Включить и перезапустить' : 'Перезапустить через маршрут',run:()=>props.client(inspected, !!offerPac)} : undefined,
     },
+    ...(measured?.media === 'working' || measured?.media === 'denied' ? [{
+      title:'Камера и микрофон', tone: (measured.media === 'working' ? 'ok' : 'warning') as Tone,
+      text: measured.media === 'working' ? 'Проверены и работают' : 'Браузер или система не разрешили доступ',
+    }] : []),
   ];
   const details: Array<[string,string]> = report ? [
     ['IPv4', report.matched === true ? 'Маршрут подтверждён для этой пробы' : report.network ? 'Адрес получен, маршрут не подтверждён' : 'Не проверено'],
@@ -174,7 +183,7 @@ export function Radar(props: Props) {
     ['Провайдер / ASN', [report.geo?.connection?.isp, report.geo?.connection?.asn && 'AS' + report.geo.connection.asn].filter(Boolean).join(' · ') || 'Нет данных'],
     ['DNS-проба', report.dns ? (report.dns.status === 'distinct' ? 'Разные резолверы в этой пробе' : report.dns.status === 'overlap' ? 'Есть совпадения' : 'Не проверено: нет ответа от сервиса сравнения') +
       ' · SOCKS5 ' + report.dns.tunnel_resolvers + ' / ОС ' + report.dns.system_resolvers : 'Не запрашивалась'],
-    ['WebRTC', measured ? measured.ice + (measured.stun ? ' · внешняя проба' : ' · локальная проба') : browser?.webrtc_protected === true ? 'disable_non_proxied_udp' : browser?.webrtc_protected === false ? 'Ограничение выключено' : 'Нет данных'],
+    ['WebRTC', measured ? measured.ice + (measured.stun ? ' · внешняя проба' : ' · внешний STUN не запускался') : browser?.webrtc_protected === true ? 'disable_non_proxied_udp' : browser?.webrtc_protected === false ? 'Ограничение выключено' : 'Нет данных'],
     ['Язык браузера', [measured?.language || browser?.actual?.language || browser?.expected_language, browser?.launch_language && '--lang=' + browser.launch_language].filter(Boolean).join(' · ') || 'Нет данных'],
     ['Часовые пояса', [browser?.expected_timezone, report.timezone, measured?.timezone || browser?.actual?.timezone].filter(Boolean).join(' / ') || 'Нет данных'],
     ['Слоты устройств', report.devices ? report.devices.used + ' из ' + report.devices.limit + ' · ПК ' + report.devices.desktop + ' · телефон ' + report.devices.mobile : 'Нет данных'],
@@ -185,7 +194,7 @@ export function Radar(props: Props) {
   }
   const phase = stage ? stages[stage] : null;
   return <div className="radar-dashboard">
-    <section className="panel radar-verdict" data-tone={verdict} aria-busy={!!stage && stage !== 'complete'}>
+    <section className="panel radar-verdict" data-tone={verdict} data-confirmed={!!measured} aria-busy={!!stage && stage !== 'complete'}>
       <div className="radar-intro">
         <span className="radar-symbol" data-tone={verdict} aria-hidden="true">{symbols[verdict]}</span>
         <div><h2>{headings[verdict]}</h2>
@@ -199,8 +208,8 @@ export function Radar(props: Props) {
       </div>
       <div className="radar-controls">
         <button className="primary" disabled={busy} onClick={connected ? props.scan : props.connect}>{stage && stage !== 'complete' ? 'Проверяем…' : connected ? report ? 'Проверить снова' : 'Проверить всё' : 'Подключить маршрут'}</button>
-        <button disabled={!connected || busy} onClick={props.scanBrowser}>Проверить в рабочем браузере</button>
-        <button disabled={!report || busy} onClick={copyReport}>Отчёт для поддержки</button>
+        <button disabled={!connected || busy} onClick={props.scanBrowser}>Проверить в браузере</button>
+        <button className="radar-support" disabled={!report || busy} onClick={copyReport}>Отчёт для поддержки</button>
       </div>
       {phase && <div className="radar-progress" role="status">
         <div className="radar-track" data-percent={phase[0]} role="progressbar" aria-label="Ход проверки подключения" aria-valuemin={0} aria-valuemax={100} aria-valuenow={phase[0]}><span/></div>

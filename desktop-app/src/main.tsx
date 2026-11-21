@@ -23,6 +23,7 @@ function App() {
   const [connection,setConnection] = useState<Connection>(empty);
   const [observed,setObserved] = useState<RadarReport|null>(null);
   const [browserReport,setBrowserReport] = useState<BrowserProbeReport|null>(null);
+  const [browserToast,setBrowserToast] = useState(0);
   const [useStun,setUseStun] = useState(false);
   const [outbound,setOutbound] = useState<Observation|null>(null);
   const networkRevision = useRef(0);
@@ -36,9 +37,9 @@ function App() {
   const [contrast,setContrast] = useState(() => localStorage.getItem('workspace.contrast') === 'on');
   const [shellIndex,setShellIndex] = useState(0);
   const [copied,setCopied] = useState('');
-  const updates = useAppUpdates(native);
-  const busy = working || updates.phase === 'downloading' || updates.phase === 'installing';
   const [loading,setLoading] = useState(native);
+  const updates = useAppUpdates(native, !loading);
+  const busy = working || updates.phase === 'downloading' || updates.phase === 'installing';
   const [message,setMessage] = useState('');
   const [installed,setInstalled] = useState<InstalledApps|null>(null);
   const [resetRegion,setResetRegion] = useState<string|null>(null);
@@ -149,6 +150,7 @@ function App() {
       setObserved(result);
       setOutbound(usableObservation(result.network));
       setRadarStage('complete');
+      return result;
     } catch (error) { setRadarStage(null); throw error; }
   }
   useEffect(() => {
@@ -157,11 +159,27 @@ function App() {
     return () => window.clearTimeout(timer);
   }, [radarStage]);
   const scan = () => perform(readRadar);
+  useEffect(() => {
+    if (!native) return;
+    const event = listen<BrowserProbeReport>('browser-probe-update', ({payload}) => {
+      setBrowserReport(payload);
+      setBrowserToast(current => current + 1);
+    });
+    return () => { void event.then(unlisten => unlisten()).catch(() => {}); };
+  }, []);
+  useEffect(() => {
+    if (!browserToast) return;
+    const timer = window.setTimeout(() => setBrowserToast(0), 4500);
+    return () => window.clearTimeout(timer);
+  }, [browserToast]);
   const scanBrowser = () => perform(async () => {
     setBrowserReport(null);
-    if (!observed) await readRadar();
-    const report = await invoke<BrowserProbeReport>('run_browser_probe', { stun: useStun });
+    const snapshot = observed ?? await readRadar();
+    const report = await invoke<BrowserProbeReport>('run_browser_probe', {
+      stun: useStun, exitIp: snapshot.network?.ip ?? null, exitCountry: snapshot.geo?.country ?? null,
+    });
     setBrowserReport(report);
+    setBrowserToast(current => current + 1);
   });
   const connectRadar = () => perform(async () => {
     if (connection.port) setConnection(await invoke<Connection>('disconnect'));
@@ -173,7 +191,8 @@ function App() {
     await readRadar();
     setMessage('Настройки рабочего профиля обновлены');
   });
-  const routeRadarClient = (client:DesktopClient) => perform(async () => {
+  const routeRadarClient = (client:DesktopClient, usePac = false) => perform(async () => {
+    if (usePac) setConnection(await invoke<Connection>('set_system_proxy',{enabled:true}));
     setConnection(await invoke<Connection>('launch_desktop_app',{client,restart:true}));
     await readRadar();
   });
@@ -194,6 +213,7 @@ function App() {
   return !account ? <main className="sign-screen"><section className="sign-card panel">
     <Brand/><h1>Вход в Workspace</h1><p>Подключите это устройство к своему рабочему пространству.</p>
     {!native && <p role="status">Веб-предпросмотр. Для входа откройте приложение Tauri.</p>}
+    {!loading && <UpdateBanner updates={updates} busy={busy}/>}
     {loading ? <p role="status">Проверяем сохранённую сессию…</p> : <form onSubmit={e=>{e.preventDefault();const data=new FormData(e.currentTarget);void perform(async()=>{
       setAccount(await invoke<Account>('sign_in',{email:data.get('email'),password:data.get('password')}));
     });}}>
@@ -224,6 +244,7 @@ function App() {
         <h1>{tabs[tab]}</h1>
         {(error || connection.proxy_error) && <p className="error" role="alert">{error || connection.proxy_error}</p>}
         {message && <p className="feedback" role="status">{message}</p>}
+        {!!browserToast && <p key={browserToast} className="radar-toast" role="status">Отчёт из рабочего браузера получен</p>}
         {account.profile.state==='pending' && <p role="status">Применяем регион. После смены региона заново откройте рабочий браузер.</p>}
         {tab===0 && <>
           <section className="connection panel">
@@ -267,7 +288,7 @@ function App() {
           region={regions.find(region=>region.id===profileRegion)?.name || ''}
           scan={()=>void scan()} connect={()=>void connectRadar()} repair={()=>void repairRadar()}
           time={()=>void perform(()=>invoke('open_time_settings'))}
-          client={client=>void routeRadarClient(client)} copy={text=>void copy(text)}
+          client={(client,usePac)=>void routeRadarClient(client,usePac)} copy={text=>void copy(text)}
         />}
         {tab===2 && <>
           <section className="panel cli-panel">
@@ -302,7 +323,7 @@ function App() {
               const enabled=e.target.checked; void perform(async()=>{ if (enabled) await ensureRoute(); setConnection(await invoke<Connection>('set_system_proxy',{enabled})); });
             }}/></label>}
             <label className="toggle-row"><span>Повышенный контраст</span><input type="checkbox" role="switch" checked={contrast} onChange={e=>{setContrast(e.target.checked);localStorage.setItem('workspace.contrast',e.target.checked?'on':'off');}}/></label>
-            <div className="actions"><button onClick={()=>void copy(['Workspace ' + updates.version, 'Регион: ' + regionName, 'Маршрут: ' + (connection.port?'активен':'отключён'), 'Задержка: ' + (outbound ? outbound.latency_ms + ' мс' : 'недоступна'), 'Точечный маршрут Store: ' + (connection.system_proxy?'включён':'выключен')].join('\n'),'log')}>{copied==='log'?'Скопировано ✓':'Скопировать лог'}</button></div>
+            <div className="actions"><button onClick={()=>void copy(['Workspace ' + updates.version, 'Регион: ' + regionName, 'Маршрут: ' + (connection.port?'активен':'отключён'), 'Задержка: ' + (outbound ? outbound.latency_ms + ' мс' : 'недоступна'), 'Точечный маршрут Store: ' + (connection.system_proxy?'включён':'выключен'),...updates.diagnostics].join('\n'),'log')}>{copied==='log'?'Скопировано ✓':'Скопировать лог'}</button></div>
           </section>
         </div>}
       </main>

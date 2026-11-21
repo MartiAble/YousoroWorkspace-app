@@ -183,3 +183,11 @@ button.quiet{border-color:transparent;background:transparent;color:var(--muted)}
 @media(prefers-reduced-motion:reduce){.radar-track>span{transition:none}.radar-track>span::after{animation:none!important}}
 
 .radar-stun{display:flex;align-items:flex-start;gap:8px;margin-block:10px;color:var(--muted)}
+
+.radar-controls{display:grid;grid-template-columns:max-content max-content;gap:6px 8px;justify-content:end}
+.radar-support{grid-column:1/-1;justify-self:end}
+.radar-verdict[data-confirmed="true"]{border-color:color-mix(in srgb,var(--route) 42%,var(--edge))}
+.radar-toast{position:fixed;z-index:10;right:20px;bottom:20px;max-width:calc(100vw - 40px);padding:12px 16px;background:var(--panel);color:var(--route);border:1px solid var(--route);border-radius:10px;box-shadow:0 8px 28px #0007;font-size:.9rem}
+@media(min-width:1000px){.radar-intro h2{white-space:nowrap}}
+@media(max-width:850px){.radar-controls{justify-content:start}.radar-support{justify-self:start}}
+@media(max-width:480px){.radar-controls{display:flex;flex-wrap:wrap}}

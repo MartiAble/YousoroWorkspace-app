@@ -3,11 +3,12 @@ import {getVersion} from '@tauri-apps/api/app';
 import {invoke} from '@tauri-apps/api/core';
 import {check, Update} from '@tauri-apps/plugin-updater';
 import {relaunch} from '@tauri-apps/plugin-process';
+import {scheduleInitialUpdate} from './startup-update.mjs';
 
 const FOUR_HOURS = 4 * 60 * 60 * 1000;
 const AUTO_CHECK = 'workspace.autoUpdate';
 
-export function useAppUpdates(native: boolean) {
+export function useAppUpdates(native: boolean, ready: boolean) {
   const [version,setVersion] = useState('');
   const [available,setAvailable] = useState<Update|null>(null);
   const [phase,setPhase] = useState<'idle'|'checking'|'downloading'|'installing'>('idle');
@@ -15,12 +16,16 @@ export function useAppUpdates(native: boolean) {
   const [message,setMessage] = useState('Проверка ещё не выполнялась');
   const [lastCheck,setLastCheck] = useState<Date|null>(null);
   const [visible,setVisible] = useState(false);
-  const [automatic,setAutomatic] = useState(() => localStorage.getItem(AUTO_CHECK) !== 'off');
+  const [automatic,setAutomatic] = useState(() => {
+    try { return localStorage.getItem(AUTO_CHECK) !== 'off'; } catch { return true; }
+  });
+  const [diagnostics,setDiagnostics] = useState<string[]>([]);
+  const dismissed = useRef<string|null>(null);
   const current = useRef<Update|null>(null);
   const lock = useRef(false);
 
   const refresh = useCallback(async () => {
-    if (!native || lock.current) return;
+    if (!native || lock.current) return "busy";
     lock.current = true;
     setPhase('checking');
     setMessage('Проверяем канал обновлений…');
@@ -29,11 +34,17 @@ export function useAppUpdates(native: boolean) {
       const old = current.current;
       current.current = next;
       setAvailable(next);
-      setVisible(next ? await invoke<boolean>('update_notice',{version:next.version,dismiss:false}).catch(() => true) : false);
+      if (next && dismissed.current !== next.version) dismissed.current = null;
+      setVisible(!!next && next.version !== dismissed.current);
       if (old) await old.close().catch(() => {});
       setMessage(next ? 'Обновление готово к скачиванию' : 'Установлена актуальная версия');
-    } catch {
+      return 'done';
+    } catch (error) {
+      const reason = String(error).replace(/https?:\/\/\S+/gi, '[адрес]')
+        .replace(/(bearer|token|password|authorization)[:=\s]+\S+/gi, '$1 [скрыто]').slice(0, 240);
+      setDiagnostics(previous => [...previous.slice(-7), new Date().toISOString() + ' · обновления · ' + reason]);
       setMessage('Канал обновлений недоступен. Проверьте сеть и повторите попытку.');
+      return 'failed';
     } finally {
       setLastCheck(new Date());
       lock.current = false;
@@ -47,19 +58,19 @@ export function useAppUpdates(native: boolean) {
     return () => { void current.current?.close().catch(() => {}); };
   }, [native]);
   useEffect(() => {
-    if (!native || !automatic) return;
-    const first = window.setTimeout(() => void refresh(), 2500);
+    if (!native || !ready || !automatic) return;
+    const stop = scheduleInitialUpdate(refresh, window);
     const periodic = window.setInterval(() => void refresh(), FOUR_HOURS);
-    return () => { window.clearTimeout(first); window.clearInterval(periodic); };
-  }, [native, automatic, refresh]);
+    return () => { stop(); window.clearInterval(periodic); };
+  }, [native, ready, automatic, refresh]);
 
   function autoCheck(enabled: boolean) {
-    localStorage.setItem(AUTO_CHECK, enabled ? 'on' : 'off');
+    try { localStorage.setItem(AUTO_CHECK, enabled ? 'on' : 'off'); } catch {}
     setAutomatic(enabled);
   }
   function later() {
     if (!current.current) return;
-    void invoke('update_notice',{version:current.current.version,dismiss:true}).catch(() => {});
+    dismissed.current = current.current.version;
     setVisible(false);
   }
   async function install() {
@@ -87,7 +98,7 @@ export function useAppUpdates(native: boolean) {
     }
   }
 
-  return {version, available, phase, transfer, message, lastCheck, visible, automatic, autoCheck, later, refresh, install};
+  return {version, available, phase, transfer, message, lastCheck, visible, diagnostics, automatic, autoCheck, later, refresh, install};
 }
 
 type Updates = ReturnType<typeof useAppUpdates>;

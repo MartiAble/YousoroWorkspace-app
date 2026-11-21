@@ -159,8 +159,21 @@ async fn run_system_radar(app: AppHandle, lookup_geo: bool, check_dns: Option<bo
     }).await
 }
 
+fn pull_browser_report(
+    client: &reqwest::blocking::Client,
+    session: &service::Session,
+    endpoint: &str,
+    token: &str,
+    after: u64,
+) -> Result<Value, String> {
+    service::checked(session.authorize(client.post(endpoint))
+        .timeout(std::time::Duration::from_secs(5))
+        .json(&json!({ "token": token, "after": after })).send())?
+        .json().map_err(|_| "Не удалось прочитать отчёт браузера".into())
+}
+
 #[tauri::command]
-async fn run_browser_probe(app: AppHandle, stun: bool) -> Result<Value, String> {
+async fn run_browser_probe(app: AppHandle, stun: bool, exit_ip: Option<String>, exit_country: Option<String>) -> Result<Value, String> {
     blocking(move || {
         let state = app.state::<Runtime>();
         let (port, region, environment) = {
@@ -171,7 +184,7 @@ async fn run_browser_probe(app: AppHandle, stun: bool) -> Result<Value, String> 
         let session = service::Session::restore()?;
         let client = service::client()?;
         #[derive(serde::Deserialize)]
-        struct Started { token: String, diagnostics_origin: String }
+        struct Started { token: String, diagnostics_origin: String, region: Option<String> }
         let started: Started = service::checked(session.authorize(client.post(
             format!("{}/api/radar-probe/start", service::ORIGIN)
         )).send())?.json().map_err(|_| "Сервер не выдал код проверки")?;
@@ -184,7 +197,12 @@ async fn run_browser_probe(app: AppHandle, stun: bool) -> Result<Value, String> 
         {
             let mut args = fragment.query_pairs_mut();
             args.append_pair("token", &started.token).append_pair("check", &started.diagnostics_origin);
-            if let Some(environment) = &environment { args.append_pair("timezone", &environment.timezone); }
+            if let Some(environment) = &environment {
+                args.append_pair("timezone", &environment.timezone).append_pair("locale", &environment.locale);
+            }
+            if let Some(region) = &started.region { args.append_pair("region", region); }
+            if let Some(ip) = &exit_ip { args.append_pair("exit_ip", ip); }
+            if let Some(country) = &exit_country { args.append_pair("exit_country", country); }
             if stun { args.append_pair("stun", "1"); }
         }
         url.set_fragment(fragment.query());
@@ -199,11 +217,31 @@ async fn run_browser_probe(app: AppHandle, stun: bool) -> Result<Value, String> 
         let endpoint = format!("{}/api/radar-probe/result", service::ORIGIN);
         while std::time::Instant::now() < wait_until {
             if status(&app).port != Some(port) { return Err("Маршрут изменился во время проверки".into()); }
-            let body: Value = service::checked(session.authorize(client.post(&endpoint))
-                .timeout(std::time::Duration::from_secs(5))
-                .json(&json!({ "token": &started.token })).send())?
-                .json().map_err(|_| "Не удалось прочитать отчёт браузера")?;
-            if !body["report"].is_null() { return Ok(body["report"].clone()); }
+            let body = pull_browser_report(&client, &session, &endpoint, &started.token, 0)?;
+            if !body["report"].is_null() {
+                let result = body["report"].clone();
+                if let Some(mut revision) = body["revision"].as_u64() {
+                    let watched_app = app.clone();
+                    std::thread::spawn(move || {
+                        let until = std::time::Instant::now() + std::time::Duration::from_secs(295);
+                        while std::time::Instant::now() < until && status(&watched_app).port == Some(port) {
+                            std::thread::sleep(std::time::Duration::from_millis(1250));
+                            let body = match pull_browser_report(&client, &session, &endpoint, &started.token, revision) {
+                                Ok(body) => body,
+                                Err(error) if error.contains("HTTP 404") || error.contains("HTTP 401") || error.contains("HTTP 403") => break,
+                                Err(_) => continue,
+                            };
+                            if let Some(next) = body["revision"].as_u64() {
+                                if next > revision && !body["report"].is_null() && status(&app).port == Some(port) {
+                                    revision = next;
+                                    let _ = watched_app.emit("browser-probe-update", body["report"].clone());
+                                }
+                            }
+                        }
+                    });
+                }
+                return Ok(result);
+            }
             std::thread::sleep(std::time::Duration::from_millis(800));
         }
         Err("Браузер не передал результат проверки. Проверьте, открылась ли вкладка Workspace.".into())
@@ -397,17 +435,11 @@ async fn browser_profile_state(app: AppHandle, region: String) -> Result<&'stati
     }).await
 }
 
-#[tauri::command]
-fn update_notice(app: AppHandle, version: String, dismiss: bool) -> bool {
-    app.state::<preferences::UpdateNotice>().show(&version, dismiss)
-}
-
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(Runtime::default())
-        .manage(preferences::UpdateNotice::default())
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" && window.app_handle().path().app_data_dir().is_ok_and(|path| preferences::close_to_tray(&path)) {
@@ -456,7 +488,7 @@ pub fn run() {
             });
         }
         Ok(())
-    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,run_browser_probe,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link,work_settings,set_work_setting,browser_profile_state,update_notice])
+    }).invoke_handler(tauri::generate_handler![sign_in,account,regions,select_region,sign_out,tunnel_status,connect_tunnel,disconnect,set_system_proxy,observe_tunnel,run_system_radar,run_browser_probe,launch_browser,clear_browser_profile,installed_desktop_apps,launch_desktop_app,launch_terminal,open_official,repair_browser_profile,open_time_settings,take_radar_link,work_settings,set_work_setting,browser_profile_state])
       .build(tauri::generate_context!()).expect("Workspace setup failed")
       .run(|app,event| match event {
           tauri::RunEvent::Exit => { let _ = disconnect(app.clone()); }

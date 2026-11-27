@@ -1,0 +1,190 @@
+{
+  "version": 3,
+  "domains": [
+    "domain:anthropic.com",
+    "domain:apple.com",
+    "domain:appleid.apple.com",
+    "domain:arkoselabs.com",
+    "domain:auth0.com",
+    "domain:bash.ws",
+    "domain:challenges.cloudflare.com",
+    "domain:chatgpt.com",
+    "domain:claude.ai",
+    "domain:claude.com",
+    "domain:claudemcpcontent.com",
+    "domain:claudeusercontent.com",
+    "domain:client-api.arkoselabs.com",
+    "domain:cloudflare.com",
+    "domain:cloudflareinsights.com",
+    "domain:ct.sendgrid.net",
+    "domain:cursor.com",
+    "domain:cursor.sh",
+    "domain:datadoghq.com",
+    "domain:featureassets.org",
+    "domain:funcaptcha.com",
+    "domain:google.com.tr",
+    "domain:google.de",
+    "domain:google.kz",
+    "domain:google.nl",
+    "domain:googleapis.com",
+    "domain:googleusercontent.com",
+    "domain:gstatic.com",
+    "domain:hcaptcha.com",
+    "domain:intercom.io",
+    "domain:intercomcdn.com",
+    "domain:launchdarkly.com",
+    "domain:link.com",
+    "domain:live.com",
+    "domain:microsoftonline.com",
+    "domain:msauth.net",
+    "domain:msauthimages.net",
+    "domain:msftauth.net",
+    "domain:msftauthimages.net",
+    "domain:oaistatic.com",
+    "domain:oaistatsig.com",
+    "domain:oaiusercontent.com",
+    "domain:onfido-ams.com",
+    "domain:onfido.com",
+    "domain:openai.com",
+    "domain:persona.com",
+    "domain:proton.me",
+    "domain:protonmail.com",
+    "domain:recaptcha.net",
+    "domain:res.cdn.office.net",
+    "domain:segment.io",
+    "domain:sentry.io",
+    "domain:sift.com",
+    "domain:siftscience.com",
+    "domain:statsig.com",
+    "domain:statsigapi.net",
+    "domain:stripe.com",
+    "domain:stripe.network",
+    "domain:sumsub.com",
+    "domain:turnstile.cloudflare.com",
+    "domain:veriff.com",
+    "domain:veriff.me",
+    "domain:withpersona.com",
+    "domain:workos.com",
+    "full:account.live.com",
+    "full:accounts.google.com",
+    "full:apis.google.com",
+    "full:appleid.apple.com",
+    "full:appleid.cdn-apple.com",
+    "full:c.s-microsoft.com",
+    "full:cdn.openaimerge.com",
+    "full:cdn.workos.com",
+    "full:challenges.cloudflare.com",
+    "full:clients4.google.com",
+    "full:forwarder.workos.com",
+    "full:frontend-apps-multi-region.workos.com",
+    "full:gemini.google.com",
+    "full:gmail.com",
+    "full:gsa.apple.com",
+    "full:humb.apple.com",
+    "full:identity.entrust.com",
+    "full:idmsa.apple.com",
+    "full:images.workoscdn.com",
+    "full:ipv6.workspace.yousoro-projects.ru",
+    "full:login.live.com",
+    "full:login.microsoftonline.com",
+    "full:mail.google.com",
+    "full:oauth2.googleapis.com",
+    "full:openidconnect.googleapis.com",
+    "full:outlook.live.com",
+    "full:outlook.office.com",
+    "full:outlook.office365.com",
+    "full:res-1.cdn.office.net",
+    "full:res.c-1.microsoft.com",
+    "full:res.public.onecdn.static.microsoft",
+    "full:rum.browser-intake-datadoghq.com",
+    "full:setup.workos.com",
+    "full:statsig.anthropic.com",
+    "full:workos.imgix.net",
+    "full:www.gmail.com",
+    "full:www.google.com",
+    "full:www.microsoft.com"
+  ],
+  "desktop_split_tun": {
+    "log": {
+      "level": "warn"
+    },
+    "dns": {
+      "servers": [
+        {
+          "type": "local",
+          "tag": "local"
+        },
+        {
+          "type": "fakeip",
+          "tag": "workspace-fake",
+          "inet4_range": "198.18.0.0/15"
+        }
+      ],
+      "rules": [
+        {
+          "domain": [],
+          "domain_suffix": [],
+          "query_type": [
+            "A"
+          ],
+          "action": "route",
+          "server": "workspace-fake"
+        },
+        {
+          "domain": [],
+          "domain_suffix": [],
+          "action": "reject",
+          "no_drop": true
+        }
+      ],
+      "final": "local"
+    },
+    "inbounds": [
+      {
+        "type": "tun",
+        "tag": "desktop-tun",
+        "auto_route": true,
+        "strict_route": false,
+        "stack": "mixed",
+        "address": [
+          "172.19.0.1/30",
+          "fdfe:dcba:9876::1/126"
+        ]
+      },
+      {
+        "type": "mixed",
+        "tag": "workspace-loopback",
+        "listen": "127.0.0.1",
+        "listen_port": 0
+      }
+    ],
+    "outbounds": [
+      {
+        "type": "direct",
+        "tag": "direct"
+      }
+    ],
+    "route": {
+      "auto_detect_interface": true,
+      "default_domain_resolver": "local",
+      "final": "direct",
+      "rules": [
+        {"inbound": "desktop-tun", "action": "sniff"},
+        {"inbound": "desktop-tun", "port": 53, "action": "hijack-dns"},
+        {"inbound": "workspace-loopback", "network": "udp", "action": "reject"},
+        {"inbound": "workspace-loopback", "ip_version": 6, "action": "reject"},
+        {"inbound": "workspace-loopback", "action": "reject", "outbound": "proxy"},
+        {"inbound": "desktop-tun", "domain": [], "domain_suffix": [], "network": "udp", "port": 443, "action": "reject"},
+        {"inbound": "desktop-tun", "domain": [], "domain_suffix": [], "network": "udp", "action": "reject"},
+        {"inbound": "desktop-tun", "domain": [], "domain_suffix": [], "ip_version": 6, "action": "reject"},
+        {"inbound": "desktop-tun", "domain": [], "domain_suffix": [], "action": "reject", "outbound": "proxy"},
+        {
+          "ip_cidr": [
+            "198.18.0.0/15"
+          ],
+          "action": "reject"
+        }
+      ]
+    }
+  }
+}

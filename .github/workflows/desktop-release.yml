@@ -53,6 +53,8 @@ jobs:
         env:
           XRAY_RELEASE_TAG: ${{ inputs.xray_tag }}
           GH_TOKEN: ${{ github.token }}
+      - name: Prepare and verify sing-box and Wintun
+        run: python scripts/prepare_sing_box.py
       - run: npm run build
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Configure HTTPS update channel

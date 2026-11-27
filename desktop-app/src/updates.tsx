@@ -135,10 +135,9 @@ export function UpdateSettings({updates,busy}:{updates:Updates;busy:boolean}) {
     <p role="status">{updates.message}{updates.lastCheck && ' · ' + updates.lastCheck.toLocaleString('ru', {dateStyle:'short',timeStyle:'short'})}</p>
     {updates.available?.body && <details className="release-notes"><summary>Изменения в v{updates.available.version}</summary><p className="update-notes">{updates.available.body}</p></details>}
     {!updates.visible && <UpdateProgress updates={updates}/>}
-    <div className="actions">
-      <button disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.refresh()}>Проверить обновления</button>
-      {updates.available && <button disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.install()}>Обновить и перезапустить</button>}
-    </div>
+    {updates.available && !updates.visible && <div className="actions">
+      <button disabled={busy || updates.phase !== 'idle'} onClick={()=>void updates.install()}>Обновить и перезапустить</button>
+    </div>}
     <label className="toggle-row"><span>Автоматически проверять обновления</span><input type="checkbox" role="switch" checked={updates.automatic} onChange={e=>updates.autoCheck(e.target.checked)}/></label>
   </section>;
 }

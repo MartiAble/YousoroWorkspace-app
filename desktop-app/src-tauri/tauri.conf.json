@@ -1,6 +1,6 @@
 {
   "productName": "Yousoro Workspace",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "identifier": "ru.yousoro.workspace",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -30,7 +30,8 @@
       "nsis"
     ],
     "externalBin": [
-      "binaries/xray"
+      "binaries/xray",
+      "binaries/sing-box"
     ],
     "resources": [
       "resources/"

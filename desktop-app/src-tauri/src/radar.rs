@@ -70,6 +70,18 @@ fn reconcile(
     }
 }
 
+pub fn route_alive(port: u16, session: &service::Session, confirmed: &mut Option<Ipv4Addr>) -> bool {
+    let observation = (|| {
+        let probe = client(port).ok()?;
+        let observation = observe(&probe).ok()?;
+        if *confirmed == Some(observation.ip) { return Some(observation.ip); }
+        let ((expected, via_gateway), _) = tunnel_check(&probe, session)?;
+        (via_gateway && expected == observation.ip).then_some(expected)
+    })();
+    *confirmed = observation;
+    confirmed.is_some()
+}
+
 pub fn observe_tunnel(port: u16) -> Result<Observation, String> {
     let client = client(port)?;
     let result = observe(&client);
@@ -78,31 +90,14 @@ pub fn observe_tunnel(port: u16) -> Result<Observation, String> {
     reconcile(result, gateway).0
 }
 
-#[derive(Serialize, Deserialize)]
-struct Geo {
-    country: Option<String>,
-    country_code: Option<String>,
-    city: Option<String>,
-    connection: Option<Provider>,
-}
-#[derive(Serialize, Deserialize)]
-struct Provider {
-    isp: Option<String>,
-    asn: Option<u32>,
-}
-
-fn geoip(ip: Ipv4Addr) -> Option<Geo> {
-    let result: Value = reqwest::blocking::Client::builder().no_proxy().timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none()).build().ok()?
-        .get(format!("https://ipwho.is/{ip}")).send().ok()?.error_for_status().ok()?.json().ok()?;
-    if result["success"] != true || result["ip"].as_str()?.parse::<Ipv4Addr>().ok()? != ip { return None; }
-    serde_json::from_value(result).ok()
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 pub struct BrowserObservation {
     timezone: String,
     language: String,
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    language_matches: Option<bool>,
     timezone_matches: Option<bool>,
 }
 
@@ -115,7 +110,7 @@ pub struct ProbeEndpoint {
 }
 
 impl BrowserProbe {
-    pub fn start(&self, port: u16, region: &str, destination: &str, timezone: Option<&str>) -> std::io::Result<ProbeEndpoint> {
+    pub fn start(&self, port: u16, region: &str, destination: &str, timezone: Option<&str>, language: Option<&str>, wait_for_timezone: bool) -> std::io::Result<ProbeEndpoint> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let local = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
@@ -126,10 +121,12 @@ impl BrowserProbe {
         let url = format!("http://{host}{path}");
         let redirect = serde_json::to_string(destination).unwrap_or_else(|_| "\"about:blank\"".into());
         let expected = serde_json::to_string(&timezone).unwrap_or_else(|_| "null".into());
+        let language = serde_json::to_string(&language).unwrap_or_else(|_| "null".into());
         let html = format!(r#"<!doctype html><meta charset="utf-8"><title>Yousoro Workspace</title>
 <script>
 const next = {redirect};
 const expected = {expected};
+function check(attempt = 0) {{
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 let matches = null;
 if (expected) {{
@@ -145,11 +142,25 @@ if (expected) {{
     }});
   }} catch {{}}
 }}
-const go = () => location.replace(next);
+const expectedLanguage = {language};
+const languages = [...navigator.languages].slice(0, 16);
+const languageMatches = expectedLanguage ? languages[0]?.toLowerCase() === expectedLanguage.toLowerCase()
+  && languages.every(value => !/^ru(?:-|$)/i.test(value)
+      && [expectedLanguage.toLowerCase(), expectedLanguage.split("-")[0].toLowerCase()].includes(value.toLowerCase())) : null;
+if ({wait_for_timezone} && expected && matches !== true && attempt < 96) {{
+  setTimeout(() => check(attempt + 1), 125);
+  return;
+}}
+const go = () => {{
+  if ((!expected || matches === true) && (!expectedLanguage || languageMatches === true)) location.replace(next);
+  else document.querySelector("p").textContent = "Рабочий сайт не открыт. Проверьте часовой пояс и язык рабочего профиля, затем откройте браузер заново.";
+}};
 setTimeout(go, 1500);
 fetch(location.pathname, {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{
-  timezone, language: navigator.language, timezone_matches: matches
+  timezone, language: navigator.language, languages, language_matches: languageMatches, timezone_matches: matches
 }})}}).finally(go);
+}}
+check();
 </script><p>Открываем рабочую страницу…</p>"#);
         let region = region.to_owned();
         let probe = self.clone();
@@ -233,6 +244,7 @@ struct Browser {
     launch_language: Option<String>,
     geolocation_blocked: Option<bool>,
     webrtc_protected: Option<bool>,
+    quic_disabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -286,13 +298,36 @@ struct NetworkProbes {
     ipv4: &'static str,
     ipv6: &'static str,
     dns: &'static str,
+    udp: &'static str,
 }
 
-fn network_probes(matched: Option<bool>, check_dns: bool, dns: Option<&dns_radar::DnsReport>) -> NetworkProbes {
+fn socks_udp_policy(port: u16) -> &'static str {
+    fn check(port: u16) -> std::io::Result<&'static str> {
+        let timeout = Duration::from_secs(1);
+        let mut socket = TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), timeout)?;
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+        socket.write_all(&[5, 1, 0])?;
+        let mut reply = [0; 2];
+        socket.read_exact(&mut reply)?;
+        if reply != [5, 0] { return Ok("unmeasured"); }
+        socket.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])?;
+        match socket.read_exact(&mut reply) {
+            Ok(()) if reply == [5, 0] => Ok("allowed"),
+            Ok(()) if reply[0] == 5 => Ok("blocked"),
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset) => Ok("blocked"),
+            _ => Ok("unmeasured"),
+        }
+    }
+    check(port).unwrap_or("unmeasured")
+}
+
+fn network_probes(matched: Option<bool>, check_dns: bool, dns: Option<&dns_radar::DnsReport>, udp: &'static str) -> NetworkProbes {
     NetworkProbes {
         ipv4: match matched { Some(true) => "confirmed", Some(false) => "mismatch", None => "unmeasured" },
         // This native observation compares IPv4 only.
         ipv6: "unmeasured",
+        udp,
         dns: if !check_dns { "disabled" } else if dns.is_some_and(dns_radar::DnsReport::measured) {
             "confirmed"
         } else { "unmeasured" },
@@ -303,10 +338,9 @@ fn network_probes(matched: Option<bool>, check_dns: bool, dns: Option<&dns_radar
 pub struct Report {
     platform: &'static str,
     probes: NetworkProbes,
-    network: Option<Observation>,
+    pub network: Option<Observation>,
     network_error: Option<String>,
     matched: Option<bool>,
-    geo: Option<Geo>,
     dns: Option<dns_radar::DnsReport>,
     devices: Option<DeviceSlots>,
     browser: Browser,
@@ -318,6 +352,18 @@ pub struct Report {
     ready: usize,
     total: usize,
     hints: Vec<&'static str>,
+}
+
+pub fn timezone_matches(local: Option<&str>, expected: Option<&str>) -> Option<bool> {
+    fn canonical(zone: &str) -> &str {
+        match zone {
+            "Turkey" | "Asia/Istanbul" => "Europe/Istanbul",
+            "Etc/UTC" | "Etc/GMT" | "GMT" => "UTC",
+            "Asia/Calcutta" => "Asia/Kolkata",
+            _ => zone,
+        }
+    }
+    local.zip(expected).map(|(local, expected)| canonical(local).eq_ignore_ascii_case(canonical(expected)))
 }
 
 fn system_timezone() -> Option<String> {
@@ -335,16 +381,17 @@ fn https_probe(client: &reqwest::blocking::Client, url: &str) -> HttpsCheck {
 }
 
 pub fn report(
-    port: u16, region: &str, app_data: &Path, probe: &BrowserProbe, lookup_geo: bool,
+    port: u16, region: &str, app_data: &Path, probe: &BrowserProbe,
     check_dns: bool, device_id: Option<&str>, environment: Option<&service::NodeEnvironment>, pac_active: bool, apps: apps::InstalledApps, progress: impl Fn(&'static str),
 ) -> Report {
     progress("network");
     let session = service::Session::restore().ok();
-    let (network, network_error, matched, geo, https, dns, devices) = std::thread::scope(|scope| {
+    let (network, network_error, matched, https, dns, devices, udp) = std::thread::scope(|scope| {
         let dns = scope.spawn(|| check_dns.then(|| dns_radar::check(port)));
+        let udp = scope.spawn(|| socks_udp_policy(port));
         let devices = scope.spawn(|| session.as_ref().and_then(|session| service::account(session).ok())
             .map(|account| device_slots(&account.bound, device_id)));
-        let (network, network_error, matched, geo, https) = match client(port) {
+        let (network, network_error, matched, https) = match client(port) {
         Ok(client) => {
             let (observation, gateway) = std::thread::scope(|scope| {
                 let probe = scope.spawn(|| session.as_ref().and_then(|session| tunnel_check(&client, session)));
@@ -352,28 +399,27 @@ pub fn report(
             });
             let result = reconcile(observation, gateway);
             progress("services");
-            let (claude, chatgpt, geo) = std::thread::scope(|scope| {
+            let (claude, chatgpt) = std::thread::scope(|scope| {
                 let claude = scope.spawn(|| https_probe(&client, "https://claude.ai/"));
                 let chatgpt = scope.spawn(|| https_probe(&client, "https://chatgpt.com/"));
-                let geo = if lookup_geo { result.0.as_ref().ok().and_then(|observation| geoip(observation.ip)) } else { None };
-                (claude.join().unwrap_or_else(|_| classify_https(None)), chatgpt.join().unwrap_or_else(|_| classify_https(None)), geo)
+                (claude.join().unwrap_or_else(|_| classify_https(None)), chatgpt.join().unwrap_or_else(|_| classify_https(None)))
             });
             let https = Some(HttpsTargets { claude, chatgpt });
             match result {
                 (Ok(observation), matched) => {
-                    (Some(observation), None, matched, geo, https)
+                    (Some(observation), None, matched, https)
                 }
-                (Err(error), _) => (None, Some(error), None, None, https),
+                (Err(error), _) => (None, Some(error), None, https),
             }
         }
-        Err(error) => (None, Some(error), None, None, None),
+        Err(error) => (None, Some(error), None, None),
         };
-        (network, network_error, matched, geo, https, dns.join().ok().flatten(), devices.join().ok().flatten())
+        (network, network_error, matched, https, dns.join().ok().flatten(), devices.join().ok().flatten(), udp.join().unwrap_or("unmeasured"))
     });
 
     progress("profile");
     let expected_timezone = environment.map(|node| node.timezone.clone());
-    let expected_language = environment.map(|node| node.locale.clone());
+    let expected_language = launch::browser_language(environment, crate::preferences::english_browser(app_data)).map(str::to_owned);
     let profile = launch::profile_path(app_data, region).ok();
     let process = profile.as_ref().and_then(|path| launch::browser_process(path).ok());
     let running = process.as_ref().map(Option::is_some);
@@ -390,19 +436,20 @@ pub fn report(
         .or_else(|| preferences.as_ref().and_then(|value| value["webrtc"]["ip_handling_policy"].as_str())
             .map(|setting| setting == "disable_non_proxied_udp"));
     let actual = (running == Some(true)).then(|| probe.observation(port, region)).flatten();
-    let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected };
+    let quic_disabled = command.map(|line| line.split_whitespace().any(|flag| flag == "--disable-quic"));
+    let browser = Browser { running, expected_timezone, expected_language, actual, launch_language, geolocation_blocked, webrtc_protected, quic_disabled };
 
     let system_proxy = Some(pac_active);
 
     let timezone = system_timezone();
     let timezone_matches = timezone.as_deref().zip(environment).map(|(actual, expected)| {
-        actual.eq_ignore_ascii_case(if cfg!(windows) { &expected.windows_timezone } else { &expected.timezone })
+        timezone_matches(Some(actual), Some(if cfg!(windows) { &expected.windows_timezone } else { &expected.timezone })).unwrap_or(false)
     });
     let checks = [
         (network.is_some(), "Проверьте, что туннель подключён и сервер диагностики доступен."),
         (https.as_ref().is_some_and(|target| target.claude.state == HttpsState::Available && target.chatgpt.state == HttpsState::Available), "Повторите HTTPS-проверку после переподключения."),
         (matched == Some(true), "Подождите, пока регион применится, затем переподключите туннель и повторите сверку узла."),
-        (browser.actual.as_ref().is_some_and(|data| data.timezone_matches == Some(true) && browser.expected_language.as_deref().is_some_and(|locale| data.language.eq_ignore_ascii_case(locale))),
+        (browser.actual.as_ref().is_some_and(|data| data.timezone_matches == Some(true) && data.language_matches == Some(true)),
             "Перезапустите рабочий браузер из Workspace. Если Windows сохраняет системный часовой пояс, сравните его с регионом."),
         (geolocation_blocked == Some(true), "Проверьте запрет геолокации в настройках рабочего профиля."),
         (webrtc_protected == Some(true), "Откройте браузер через Workspace, чтобы применить ограничение WebRTC."),
@@ -434,13 +481,35 @@ pub fn report(
         if timezone_matches == Some(true) { ready += 1; }
         else { hints.push("Сверьте часовой пояс Windows с выбранным узлом."); }
     }
-    let probes = network_probes(matched, check_dns, dns.as_ref());
-    Report { platform: std::env::consts::OS, probes, network, network_error, matched, geo, dns, devices, browser, timezone, timezone_matches, https, system_proxy, apps, ready, total, hints }
+    let probes = network_probes(matched, check_dns, dns.as_ref(), udp);
+    Report { platform: std::env::consts::OS, probes, network, network_error, matched, dns, devices, browser, timezone, timezone_matches, https, system_proxy, apps, ready, total, hints }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socks_udp_probe_measures_the_response_to_associate() {
+        for (response, expected) in [([5, 7], "blocked"), ([5, 0], "allowed")] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let (mut peer, _) = listener.accept().unwrap();
+                    let mut greeting = [0; 3];
+                    peer.read_exact(&mut greeting).unwrap();
+                    assert_eq!(greeting, [5, 1, 0]);
+                    peer.write_all(&[5, 0]).unwrap();
+                    let mut associate = [0; 10];
+                    peer.read_exact(&mut associate).unwrap();
+                    assert_eq!(&associate[..4], &[5, 3, 0, 1]);
+                    peer.write_all(&response).unwrap();
+                });
+                assert_eq!(socks_udp_policy(port), expected);
+            });
+        }
+    }
 
     #[test]
     fn separates_service_restrictions_from_success_and_failure() {
@@ -504,20 +573,28 @@ mod tests {
     #[test]
     fn report_keeps_unknown_distinct_from_failed_and_includes_readiness() {
         let report = Report {
-            platform: "windows", probes: network_probes(Some(false), false, None),
+            platform: "windows", probes: network_probes(Some(false), false, None, "unmeasured"),
             network: Some(Observation { ip: "8.8.8.8".parse().unwrap(), latency_ms: 123 }),
-            network_error: None, matched: Some(false), geo: None, dns: None, devices: None,
+            network_error: None, matched: Some(false), dns: None, devices: None,
             browser: Browser { running: Some(true), expected_timezone: Some("Europe/Berlin".into()), expected_language: Some("de-DE".into()),
-                actual: None, launch_language: Some("de-DE".into()), geolocation_blocked: Some(false), webrtc_protected: None },
+                actual: None, launch_language: Some("de-DE".into()), geolocation_blocked: Some(false), webrtc_protected: None, quic_disabled: None },
             timezone: None, timezone_matches: None, https: None, system_proxy: Some(false),
-            apps: apps::InstalledApps { claude: None, chatgpt: None }, ready: 1, total: 5, hints: vec!["hint"],
+            apps: apps::InstalledApps::default(), ready: 1, total: 5, hints: vec!["hint"],
         };
         let json = serde_json::to_value(report).unwrap();
         assert_eq!(json["network"]["ip"], "8.8.8.8");
         assert_eq!(json["network"]["latency_ms"], 123);
         assert_eq!(json["matched"], false);
-        assert_eq!(json["probes"], serde_json::json!({"ipv4":"mismatch", "ipv6":"unmeasured", "dns":"disabled"}));
+        assert_eq!(json["probes"], serde_json::json!({"ipv4":"mismatch", "ipv6":"unmeasured", "dns":"disabled", "udp":"unmeasured"}));
         assert!(json["browser"]["actual"].is_null());
         assert_eq!(json["total"], 5);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn compares_system_timezone_to_dedicated_exit() {
+    assert_eq!(timezone_matches(Some("Turkey"), Some("Europe/Istanbul")), Some(true));
+    assert_eq!(timezone_matches(Some("Europe/Moscow"), Some("Europe/Istanbul")), Some(false));
+    assert_eq!(timezone_matches(Some("Europe/Istanbul"), None), None);
 }

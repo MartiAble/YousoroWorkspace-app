@@ -36,6 +36,14 @@ extern "system" {
     fn QueryFullProcessImageNameW(process: Handle, flags: u32, name: *mut u16, length: *mut u32) -> i32;
     fn ProcessIdToSessionId(process: u32, session: *mut u32) -> i32;
     fn GetDynamicTimeZoneInformation(zone: *mut DynamicTimeZone) -> u32;
+    fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+    fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, size: u32) -> i32;
+    fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+}
+
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetExtendedTcpTable(table: *mut c_void, size: *mut u32, ordered: i32, family: u32, class: i32, reserved: u32) -> u32;
 }
 
 #[link(name = "ntdll")]
@@ -217,6 +225,14 @@ pub fn discover_packages() -> [Option<Package>; 2] {
     [find("Claude"), find("OpenAI.ChatGPT-Desktop").or_else(|| find("OpenAI.Codex"))]
 }
 
+pub fn discover_cursor() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").into_iter()
+        .map(|root| PathBuf::from(root).join("Programs").join("cursor").join("Cursor.exe"))
+        .chain(["ProgramFiles", "ProgramFiles(x86)"].into_iter().filter_map(std::env::var_os)
+            .map(|root| PathBuf::from(root).join("Cursor").join("Cursor.exe")))
+        .find(|path| path.is_file())
+}
+
 pub fn discover_classic(claude: bool) -> Option<PathBuf> {
     let (name, exe) = if claude { ("Claude", "Claude.exe") } else { ("ChatGPT", "ChatGPT.exe") };
     if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -276,6 +292,65 @@ struct ProcessEntry {
 #[repr(C)]
 struct UnicodeString { length: u16, capacity: u16, data: *const u16 }
 
+#[repr(C)]
+struct JobBasicLimits {
+    process_time: i64,
+    job_time: i64,
+    flags: u32,
+    min_working_set: usize,
+    max_working_set: usize,
+    processes: u32,
+    affinity: usize,
+    priority: u32,
+    scheduling: u32,
+}
+
+#[repr(C)]
+struct JobExtendedLimits {
+    basic: JobBasicLimits,
+    io_counters: [u64; 6],
+    process_memory: usize,
+    job_memory: usize,
+    peak_process_memory: usize,
+    peak_job_memory: usize,
+}
+
+pub fn owns_loopback_listener(port: u16, pid: u32) -> bool {
+    const AF_INET: u32 = 2;
+    const OWNER_PID_LISTENER: i32 = 3;
+    const BUFFER_TOO_SMALL: u32 = 122;
+    let mut size = 0;
+    if unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, AF_INET, OWNER_PID_LISTENER, 0) }
+        != BUFFER_TOO_SMALL || size > 1024 * 1024 {
+        return false;
+    }
+    let mut table = vec![0u32; (size as usize).div_ceil(4)];
+    if unsafe { GetExtendedTcpTable(table.as_mut_ptr().cast(), &mut size, 0, AF_INET, OWNER_PID_LISTENER, 0) } != 0 {
+        return false;
+    }
+    // MIB_TCPTABLE_OWNER_PID contains a row count and six DWORDs per TCP row.
+    table.get(1..).unwrap_or_default().chunks_exact(6).take(table.first().copied().unwrap_or(0) as usize)
+        .any(|row| row[1].to_ne_bytes() == [127, 0, 0, 1] && u16::from_be(row[2] as u16) == port && row[5] == pid)
+}
+
+pub fn process_job(child: &std::process::Child) -> io::Result<impl Drop> {
+    use std::os::windows::io::AsRawHandle;
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() { return Err(io::Error::last_os_error()); }
+        let job = OwnedHandle(job);
+        let mut limits: JobExtendedLimits = std::mem::zeroed();
+        limits.basic.flags = KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(job.0, EXTENDED_LIMIT_INFORMATION, (&limits as *const JobExtendedLimits).cast(),
+            std::mem::size_of_val(&limits) as u32) == 0 || AssignProcessToJobObject(job.0, child.as_raw_handle()) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+}
+
 struct OwnedHandle(Handle);
 impl Drop for OwnedHandle { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
 
@@ -287,10 +362,12 @@ pub struct Process {
     pub command: Option<String>,
 }
 
-pub fn machine_user_id() -> io::Result<String> {
-    let guid = Key::open(HKLM, r"SOFTWARE\Microsoft\Cryptography", KEY_READ)?
-        .string("MachineGuid")?.filter(|value| !value.is_empty())
-        .ok_or(io::ErrorKind::NotFound)?;
+pub fn machine_id() -> io::Result<String> {
+    Key::open(HKLM, r"SOFTWARE\Microsoft\Cryptography", KEY_READ)?
+        .string("MachineGuid")?.filter(|value| !value.is_empty()).ok_or(io::ErrorKind::NotFound.into())
+}
+
+pub fn legacy_machine_user_id(guid: &str) -> io::Result<String> {
     let mut handle = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut handle) } == 0 {
         return Err(io::Error::last_os_error());

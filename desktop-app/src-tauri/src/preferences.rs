@@ -5,6 +5,21 @@ const STARTUP_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const STARTUP_VALUE: &str = "YousoroWorkspace";
 
+pub fn english_browser(data: &Path) -> bool { !data.join("regional-browser-language").is_file() }
+
+pub fn set_english_browser(data: &Path, enabled: bool) -> io::Result<()> {
+    let path = data.join("regional-browser-language");
+    if enabled {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    } else {
+        fs::create_dir_all(data)?;
+        fs::write(path, [])
+    }
+}
+
 fn tray_file(data: &Path) -> PathBuf { data.join("close-to-tray") }
 
 pub fn close_to_tray(data: &Path) -> bool { tray_file(data).is_file() }

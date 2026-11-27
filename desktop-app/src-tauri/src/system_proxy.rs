@@ -122,10 +122,13 @@ impl Lease {
         let expected = before.with_pac(server.url.clone())?;
         let journal = Journal { before, expected };
         let serialized = serde_json::to_vec(&journal).map_err(|_| "Не удалось сохранить исходный прокси")?;
+        let staging = lease.journal.with_extension("pending");
         let save = || -> std::io::Result<()> {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&lease.journal)?;
+            let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(&staging)?;
             file.write_all(&serialized)?;
-            file.sync_all()
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&staging, &lease.journal)
         };
         save().map_err(|_| "Не удалось сохранить исходный прокси")?;
         lease.restored = false;
@@ -142,6 +145,14 @@ impl Lease {
     }
 
     pub fn restore(&mut self) -> Result<(), String> {
+        self.restore_with(read_settings, write_settings)
+    }
+
+    fn restore_with(
+        &mut self,
+        read: impl FnOnce() -> Result<Settings, String>,
+        write: impl FnOnce(&Settings, &Settings) -> Result<(), String>,
+    ) -> Result<(), String> {
         let bytes = match fs::read(&self.journal) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -149,9 +160,9 @@ impl Lease {
         };
         let journal: Journal = serde_json::from_slice(&bytes)
             .map_err(|_| "Не удалось прочитать исходные настройки прокси")?;
-        let current = read_settings()?;
+        let current = read()?;
         let restored = current.restore(&journal.expected, &journal.before);
-        write_settings(&current, &restored)?;
+        write(&current, &restored)?;
         fs::remove_file(&self.journal).map_err(|_| "Не удалось завершить восстановление прокси")?;
         self.restored = true;
         self.server = None;
@@ -262,6 +273,31 @@ mod tests {
         assert_eq!(restored.server, changed.server);
         assert_eq!(restored.pac, None);
         assert_eq!(restored.enable, None);
+    }
+
+    #[test]
+    fn journal_survives_restore_error_and_recovers_in_a_new_instance() {
+        let directory = std::env::temp_dir().join(format!("workspace-proxy-test-{}-{:?}",
+            std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let mut lease = Lease::lock(&directory).unwrap();
+        let before = Settings::default();
+        let expected = before.with_pac("http://127.0.0.1:42000/workspace.pac".into()).unwrap();
+        let journal = Journal { before: before.clone(), expected: expected.clone() };
+        fs::write(&lease.journal, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(lease.restore_with(|| Ok(expected.clone()), |_, _| Err("registry unavailable".into())).is_err());
+        assert!(lease.journal.exists());
+        drop(lease);
+
+        let mut restarted = Lease::lock(&directory).unwrap();
+        restarted.restore_with(|| Ok(expected.clone()), |current, restored| {
+            assert_eq!(*current, expected);
+            assert_eq!(*restored, before);
+            Ok(())
+        }).unwrap();
+        assert!(!restarted.journal.exists());
+        restarted.restore_with(|| panic!("no journal"), |_, _| panic!("no write")).unwrap();
+        drop(restarted);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

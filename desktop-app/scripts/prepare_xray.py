@@ -41,8 +41,8 @@ def main():
 
     tauri = Path(__file__).resolve().parents[1] / "src-tauri"
     config = json.loads((tauri / "tauri.conf.json").read_text(encoding="utf-8"))
-    if config["bundle"]["externalBin"] != ["binaries/xray"]:
-        raise SystemExit("Expected bundle.externalBin to be ['binaries/xray']")
+    if "binaries/xray" not in config["bundle"]["externalBin"]:
+        raise SystemExit("Expected binaries/xray in bundle.externalBin")
     binaries = tauri / "binaries"
     resources = tauri / "resources"
     binaries.mkdir(exist_ok=True)

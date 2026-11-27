@@ -55,10 +55,10 @@ pub fn repair_preferences(profile: &Path) -> Result<(), String> {
     if browser_process(profile)?.is_some() {
         return Err("Закройте рабочий браузер и повторите исправление".into());
     }
-    update_privacy_preferences(profile).map_err(|_| "Не удалось сохранить настройки профиля".into())
+    update_privacy_preferences(profile, None).map_err(|_| "Не удалось сохранить настройки профиля".into())
 }
 
-fn update_privacy_preferences(profile: &Path) -> io::Result<()> {
+fn update_privacy_preferences(profile: &Path, language: Option<&str>) -> io::Result<()> {
     let directory = profile.join("Default");
     let path = directory.join("Preferences");
     (|| -> io::Result<()> {
@@ -73,7 +73,19 @@ fn update_privacy_preferences(profile: &Path) -> io::Result<()> {
         for (keys, value) in [
             (&["profile", "default_content_setting_values", "geolocation"][..], serde_json::json!(2)),
             (&["webrtc", "ip_handling_policy"][..], serde_json::json!(WEBRTC_POLICY)),
-        ] {
+            (&["dns_over_https", "mode"][..], serde_json::json!("off")),
+            (&["net", "network_prediction_options"][..], serde_json::json!(2)),
+            (&["autofill", "profile_enabled"][..], serde_json::json!(false)),
+            (&["autofill", "credit_card_enabled"][..], serde_json::json!(false)),
+            (&["translate", "enabled"][..], serde_json::json!(false)),
+        ].into_iter().chain(language.into_iter().flat_map(|locale| {
+            let base = locale.split('-').next().unwrap_or(locale);
+            let list = if base == locale { base.to_owned() } else { format!("{locale},{base}") };
+            [
+                (&["intl", "accept_languages"][..], serde_json::json!(list)),
+                (&["intl", "selected_languages"][..], serde_json::json!(list)),
+            ]
+        })) {
             let mut entry = &mut settings;
             for key in keys {
                 entry = entry.as_object_mut().ok_or_else(|| io::Error::other("Invalid preferences"))?
@@ -127,20 +139,24 @@ pub fn proxied_command(executable: &Path, port: u16) -> Command {
     command
 }
 
-fn browser_command(browser: &Path, profile: &Path, port: u16, environment: Option<&NodeEnvironment>, url: &str, probe_port: Option<u16>) -> Command {
+fn browser_command(browser: &Path, profile: &Path, port: u16, environment: Option<&NodeEnvironment>, english: bool, url: &str, probe_port: Option<u16>) -> Command {
     let mut profile_arg = OsString::from("--user-data-dir=");
     profile_arg.push(profile);
 
     let mut command = proxied_command(browser, port);
     let bypass = probe_port.map_or_else(|| "<-loopback>".into(), |port| format!("<-loopback>;127.0.0.1:{port}"));
     if let Some(environment) = environment {
-        command.env("TZ", &environment.timezone).arg(format!("--lang={}", environment.locale));
+        command.env("TZ", &environment.timezone);
+    }
+    if let Some(locale) = browser_language(environment, english) {
+        command.arg(format!("--lang={locale}"));
     }
     command
         .arg(profile_arg)
         .arg(format!("--webrtc-ip-handling-policy={WEBRTC_POLICY}"))
         .arg(format!("--force-webrtc-ip-handling-policy={WEBRTC_POLICY}"))
         .arg(format!("--proxy-bypass-list={bypass}"))
+        .arg("--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1")
         .args(["--disable-quic", "--no-first-run", "--no-default-browser-check", "--disable-background-mode", url]);
     command
 }
@@ -176,20 +192,28 @@ pub fn browser_process(profile: &Path) -> Result<Option<String>, String> {
     }
 }
 
-pub fn launch_browser(profile: &Path, port: u16, region: &str, environment: Option<&NodeEnvironment>, url: &str, probe: &crate::radar::BrowserProbe) -> Result<(), String> {
+pub fn browser_language(environment: Option<&NodeEnvironment>, english: bool) -> Option<&str> {
+    environment.map(|node| node.locale.as_str()).or(english.then_some("en-US"))
+}
+
+pub fn launch_browser(profile: &Path, port: u16, region: &str, environment: Option<&NodeEnvironment>, english: bool, url: &str, probe: &crate::radar::BrowserProbe, override_zone: Option<&str>) -> Result<bool, String> {
     let browser = find_browser().ok_or("Установите Chrome, Brave или Microsoft Edge")?;
     if browser_process(profile)?.is_some() {
         return Err("Закройте рабочий браузер этого региона перед повторным запуском".into());
     }
-    update_privacy_preferences(profile).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
-    let endpoint = probe.start(port, region, url, environment.map(|node| node.timezone.as_str())).ok();
-    let (startup_url, probe_port) = endpoint.as_ref().map_or((url, None), |probe| (probe.url.as_str(), Some(probe.port)));
-    let command = browser_command(&browser, profile, port, environment, startup_url, probe_port);
-    spawn(command)
-        .map_err(|_| "Не удалось запустить браузер".into())
+    update_privacy_preferences(profile, browser_language(environment, english)).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
+    let endpoint = probe.start(port, region, url, environment.map(|node| node.timezone.as_str()), browser_language(environment, english), override_zone.is_some())
+        .map_err(|_| "Не удалось проверить настройки рабочего браузера")?;
+    let command = browser_command(&browser, profile, port, environment, english, &endpoint.url, Some(endpoint.port));
+    #[cfg(windows)]
+    if let Some(zone) = override_zone {
+        return Ok(crate::chromium_timezone::start(command, zone).is_ok());
+    }
+    spawn(command).map_err(|_| "Не удалось открыть страницу рабочего браузера".to_owned())?;
+    Ok(true)
 }
 
-pub fn open_probe(profile: &Path, port: u16, environment: Option<&NodeEnvironment>, url: &str) -> Result<(), String> {
+pub fn open_probe(profile: &Path, port: u16, environment: Option<&NodeEnvironment>, english: bool, url: &str) -> Result<(), String> {
     let browser = find_browser().ok_or("Установите Chrome, Brave или Microsoft Edge")?;
     if let Some(process) = browser_process(profile)? {
         let proxy = format!("--proxy-server=socks5://127.0.0.1:{port}");
@@ -197,9 +221,9 @@ pub fn open_probe(profile: &Path, port: u16, environment: Option<&NodeEnvironmen
             return Err("Закройте рабочий браузер прежнего подключения и повторите проверку.".into());
         }
     } else {
-        update_privacy_preferences(profile).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
+        update_privacy_preferences(profile, browser_language(environment, english)).map_err(|_| "Не удалось подготовить настройки рабочего профиля")?;
     }
-    spawn(browser_command(&browser, profile, port, environment, url, None))
+    spawn(browser_command(&browser, profile, port, environment, english, url, None))
         .map_err(|_| "Не удалось открыть страницу проверки".into())
 }
 
@@ -226,7 +250,7 @@ mod tests {
 
     #[test]
     fn older_servers_keep_browser_defaults() {
-        let command = browser_command(Path::new("browser"), Path::new("profile"), 10081, None, "https://example.invalid", None);
+        let command = browser_command(Path::new("browser"), Path::new("profile"), 10081, None, false, "https://example.invalid", None);
         assert!(!command.get_args().any(|arg| arg.to_string_lossy().starts_with("--lang=")));
         assert!(!command.get_envs().any(|(key, _)| key == "TZ"));
     }
@@ -258,27 +282,36 @@ mod tests {
         fs::create_dir_all(&default).unwrap();
         fs::write(&path, r#"{"profile":{"default_content_setting_values":{"geolocation":1,"camera":2}},"webrtc":{"ip_handling_policy":"default"},"homepage":"about:blank"}"#).unwrap();
         fs::write(default.join("Cookies"), b"existing session").unwrap();
-        update_privacy_preferences(&profile).unwrap();
+        update_privacy_preferences(&profile, Some("en-US")).unwrap();
         assert_eq!(fs::read(default.join("Cookies")).unwrap(), b"existing session");
         let bytes = fs::read(&path).unwrap();
-        update_privacy_preferences(&profile).unwrap();
+        update_privacy_preferences(&profile, Some("en-US")).unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         let updated: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(updated["profile"]["default_content_setting_values"]["geolocation"], 2);
         assert_eq!(updated["profile"]["default_content_setting_values"]["camera"], 2);
         assert_eq!(updated["webrtc"]["ip_handling_policy"], WEBRTC_POLICY);
+        assert_eq!(updated["dns_over_https"]["mode"], "off");
+        assert_eq!(updated["net"]["network_prediction_options"], 2);
         assert_eq!(updated["homepage"], "about:blank");
+        assert_eq!(updated["intl"]["accept_languages"], "en-US,en");
+        assert_eq!(updated["intl"]["selected_languages"], "en-US,en");
+        assert_eq!(updated["autofill"]["profile_enabled"], false);
+        assert_eq!(updated["translate"]["enabled"], false);
         fs::remove_dir_all(profile).unwrap();
     }
 
     #[test]
     fn browser_passes_regional_privacy_and_proxy_settings() {
         let environment = NodeEnvironment { timezone: "Asia/Almaty".into(), windows_timezone: "West Asia Standard Time".into(), locale: "ru-RU".into() };
-        let command = browser_command(Path::new("browser"), Path::new("Profile with spaces"), 10081, Some(&environment), "https://example.invalid", None);
+        let command = browser_command(Path::new("browser"), Path::new("Profile with spaces"), 10081, Some(&environment), false, "https://example.invalid", None);
         let args: Vec<_> = command.get_args().collect();
         for expected in [
             "--user-data-dir=Profile with spaces",
             "--proxy-server=socks5://127.0.0.1:10081",
+            "--proxy-bypass-list=<-loopback>",
+            "--disable-quic",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
             "--lang=ru-RU",
             "--webrtc-ip-handling-policy=disable_non_proxied_udp",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -286,6 +319,12 @@ mod tests {
             assert!(args.iter().any(|arg| *arg == expected));
         }
         assert!(command.get_envs().any(|(key, value)| key == "TZ" && value.unwrap() == "Asia/Almaty"));
+    }
+
+    #[test]
+    fn english_setting_sets_browser_language_without_node_metadata() {
+        let command = browser_command(Path::new("browser"), Path::new("profile"), 10081, None, true, "https://example.invalid", None);
+        assert!(command.get_args().any(|arg| arg == "--lang=en-US"));
     }
 
     #[test]

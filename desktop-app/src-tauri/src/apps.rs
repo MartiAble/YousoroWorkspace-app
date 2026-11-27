@@ -1,14 +1,17 @@
 use crate::launch::spawn;
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, process::Command};
+use std::{io, path::{Path, PathBuf}, process::Command};
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum DesktopApp { Claude, Chatgpt }
+pub enum DesktopApp { Claude, Chatgpt, Cursor }
+
+#[cfg(not(windows))]
+const CLIENTS: [DesktopApp; 3] = [DesktopApp::Claude, DesktopApp::Chatgpt, DesktopApp::Cursor];
 
 impl DesktopApp {
     fn name(self) -> &'static str {
-        match self { Self::Claude => "Claude", Self::Chatgpt => "ChatGPT" }
+        match self { Self::Claude => "Claude", Self::Chatgpt => "ChatGPT", Self::Cursor => "Cursor" }
     }
 
     #[cfg(any(not(windows), test))]
@@ -36,6 +39,7 @@ fn mac_bundle_binary(contents: &Path, executable: &str) -> Option<PathBuf> {
 #[derive(Clone)]
 struct Process {
     id: u32,
+    image: Option<PathBuf>,
     command: Option<String>,
 }
 
@@ -66,7 +70,7 @@ impl Discovery {
             .or_else(|| store.map(|id| Target::Appx(id.clone())))
     }
 
-    fn status(&self, port: Option<u16>, system_proxy: bool) -> DesktopStatus {
+    fn status(&self, port: Option<u16>, system_proxy: bool, system_tun: bool) -> DesktopStatus {
         let running = !self.processes.is_empty();
         let target = self.target(system_proxy);
         let store = self.package.as_deref().is_some_and(valid_aumid);
@@ -80,6 +84,7 @@ impl Discovery {
             can_launch: target.is_some(),
             variant: self.package.as_deref().filter(|id| id.starts_with("OpenAI.Codex_")).map(|_| "Codex Desktop"),
             running,
+            unprotected: !system_tun && self.processes.iter().any(|process| !uses_workspace_proxy(process.command.as_deref(), port)),
             store,
             proxy: if proxy { "arguments" } else if running && store && system_proxy { "pac" } else { "unknown" },
         }
@@ -94,13 +99,13 @@ fn valid_aumid(id: &str) -> bool {
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
-struct Installations([Discovery; 2]);
+struct Installations([Discovery; 3]);
 
 fn discover_installed_clients() -> Installations {
     #[cfg(windows)]
     {
         let [claude, openai] = crate::native_windows::discover_packages();
-        Installations([claude, openai].map(|package| {
+        Installations([claude, openai, None].map(|package| {
             let mut found = Discovery::default();
             if let Some(package) = package {
                 found.package = Some(package.aumid);
@@ -113,7 +118,7 @@ fn discover_installed_clients() -> Installations {
     }
     #[cfg(not(windows))]
     {
-        Installations([DesktopApp::Claude, DesktopApp::Chatgpt].map(|client| Discovery {
+        Installations(CLIENTS.map(|client| Discovery {
             paths: std::iter::once(PathBuf::from("/Applications"))
                 .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Applications")))
                 .filter_map(|root| client.mac_executable(&root)).collect(),
@@ -125,9 +130,9 @@ fn discover_installed_clients() -> Installations {
 impl Installations {
     #[cfg(windows)]
     fn with_classic(mut self) -> Self {
-        for (index, app) in self.0.iter_mut().enumerate() {
-            app.paths.extend(crate::native_windows::discover_classic(index == 0));
-        }
+        self.0[0].paths.extend(crate::native_windows::discover_classic(true));
+        self.0[1].paths.extend(crate::native_windows::discover_classic(false));
+        self.0[2].paths.extend(crate::native_windows::discover_cursor());
         self
     }
 
@@ -162,10 +167,12 @@ impl Installations {
     fn check_running_clients(mut self) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let processes = crate::native_windows::processes(&["claude.exe", "chatgpt.exe", "codex.exe"])
+            let processes = crate::native_windows::processes(&["claude.exe", "chatgpt.exe", "codex.exe", "cursor.exe"])
                 .map_err(|_| "Не удалось проверить процессы Windows")?;
             for process in processes {
-                let index = usize::from(!process.name.eq_ignore_ascii_case("claude.exe"));
+                let index = match process.name.to_ascii_lowercase().as_str() {
+                    "claude.exe" => 0, "cursor.exe" => 2, _ => 1,
+                };
                 let found = &mut self.0[index];
                 let image = process.image.as_deref();
                 let from_package = image.zip(found.package_root.as_deref()).is_some_and(|(image, root)| {
@@ -176,10 +183,10 @@ impl Installations {
                 let codex = process.name.eq_ignore_ascii_case("codex.exe");
                 if codex && !from_package { continue; }
                 if process.command.as_deref().is_some_and(|command| command.contains(" --type=")) { continue; }
-                if !codex && !from_package && found.paths.is_empty() {
+                if index != DesktopApp::Cursor as usize && !codex && !from_package && found.paths.is_empty() {
                     found.paths.extend(image.filter(|path| path.is_file()).map(Path::to_path_buf));
                 }
-                found.processes.push(Process { id: process.id, command: process.command });
+                found.processes.push(Process { id: process.id, image: process.image, command: process.command });
             }
         }
         #[cfg(not(windows))]
@@ -188,16 +195,16 @@ impl Installations {
                 .map_err(|_| "Не удалось проверить процессы macOS")?;
             if !output.status.success() { return Err("macOS не вернула список процессов".into()); }
             let list = String::from_utf8_lossy(&output.stdout);
-            for (client, found) in [DesktopApp::Claude, DesktopApp::Chatgpt].into_iter().zip(self.0.iter_mut()) {
+            for (client, found) in CLIENTS.into_iter().zip(self.0.iter_mut()) {
                 let name = client.name();
                 let entries = std::iter::once(name).chain(found.paths.iter().filter_map(|p| p.file_name()?.to_str()));
                 let markers: Vec<_> = entries.map(|binary| format!("/{name}.app/Contents/MacOS/{binary}")).collect();
                 found.processes = list.lines().filter_map(|line| {
                     let (pid, command) = line.trim_start().split_once(' ')?;
                     let command = command.trim_start();
-                    let (prefix, tail) = markers.iter().find_map(|marker| command.split_once(marker))?;
+                    let (marker, (prefix, tail)) = markers.iter().find_map(|marker| Some((marker, command.split_once(marker)?)))?;
                     if !prefix.starts_with('/') || prefix.contains(" -") || (!tail.is_empty() && !tail.starts_with(' ')) { return None; }
-                    Some(Process { id: pid.parse().ok()?, command: Some(command.to_owned()) })
+                    Some(Process { id: pid.parse().ok()?, image: Some(PathBuf::from(format!("{prefix}{marker}"))), command: Some(command.to_owned()) })
                 }).collect();
             }
         }
@@ -240,7 +247,7 @@ impl AppCache {
         self.refresh(data).map(|_| ())
     }
 
-    pub fn check_running_clients(&self, data: &Path, port: Option<u16>, pac: bool) -> Result<InstalledApps, String> {
+    pub fn check_running_clients(&self, data: &Path, port: Option<u16>, pac: bool, system_tun: bool) -> Result<InstalledApps, String> {
         let installed = self.cached(data)?;
         let found = if let Some(_job) = self.poll.try_enter() {
             let found = installed.check_running_clients()?;
@@ -249,8 +256,12 @@ impl AppCache {
         } else {
             self.running.lock().map_err(|_| "Ошибка кэша процессов")?.clone().unwrap_or(installed)
         };
-        let [claude, chatgpt] = found.0;
-        Ok(InstalledApps { claude: Some(claude.status(port, pac)), chatgpt: Some(chatgpt.status(port, pac)) })
+        let [claude, chatgpt, cursor] = found.0;
+        Ok(InstalledApps {
+            claude: Some(claude.status(port, pac, system_tun)),
+            chatgpt: Some(chatgpt.status(port, pac, system_tun)),
+            cursor: Some(cursor.status(port, false, system_tun)),
+        })
     }
 }
 
@@ -260,6 +271,7 @@ pub struct DesktopStatus {
     pub can_launch: bool,
     pub variant: Option<&'static str>,
     pub running: bool,
+    pub unprotected: bool,
     pub store: bool,
     pub proxy: &'static str,
 }
@@ -268,13 +280,54 @@ pub struct DesktopStatus {
 pub struct InstalledApps {
     pub claude: Option<DesktopStatus>,
     pub chatgpt: Option<DesktopStatus>,
+    pub cursor: Option<DesktopStatus>,
+}
+
+impl InstalledApps {
+    pub fn unprotected(&self) -> [bool; 3] {
+        [&self.claude, &self.chatgpt, &self.cursor].map(|app| app.as_ref().is_some_and(|app| app.unprotected))
+    }
+}
+
+pub fn notify_unprotected() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let script = r#"
+[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null
+[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime] > $null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>Yousoro Workspace</text><text>Обнаружен запуск рабочего приложения без подтверждённого прокси.</text></binding></visual></toast>')
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ru.yousoro.workspace').Show($toast)
+"#;
+        let mut command = Command::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        command.args(["-NoProfile", "-NonInteractive", "-Command", script]).creation_flags(0x08000000);
+        spawn(command)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("/usr/bin/osascript");
+        command.args(["-e", r#"display notification "Обнаружен запуск рабочего приложения без подтверждённого прокси." with title "Yousoro Workspace""#]);
+        spawn(command)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    Ok(())
+}
+
+fn uses_workspace_proxy(command: Option<&str>, port: Option<u16>) -> bool {
+    command.zip(port).is_some_and(|(command, port)| {
+        let expected = format!("--proxy-server=http://127.0.0.1:{port}");
+        let mut args = command.split_whitespace().map(|arg| arg.trim_matches('"'));
+        args.clone().any(|arg| arg == expected) && args.any(|arg| arg == "--disable-quic")
+    })
 }
 
 fn desktop_command(executable: &Path, port: u16) -> Command {
     let mut command = Command::new(executable);
     let http = format!("http://127.0.0.1:{port}");
     let socks = format!("socks5h://127.0.0.1:{port}");
-    command.arg(format!("--proxy-server={http}")).arg("--proxy-bypass-list=<-loopback>")
+    command.arg(format!("--proxy-server={http}")).arg("--proxy-bypass-list=<-loopback>").arg("--disable-quic")
         .env("HTTP_PROXY", &http).env("HTTPS_PROXY", &http).env("ALL_PROXY", &socks)
         .env("http_proxy", &http).env("https_proxy", &http).env("all_proxy", &socks)
         .env_remove("NO_PROXY").env_remove("no_proxy");
@@ -296,12 +349,19 @@ fn close_for_restart(app: DesktopApp, installed: &Installations, running: &[Proc
     Err(format!("Клиент {} остался запущен в фоне. Полностью закройте его и повторите запуск.", app.name()))
 }
 
-pub fn launch(cache: &AppCache, data: &Path, app: DesktopApp, port: u16, restart: bool, pac_active: bool) -> Result<(), String> {
+pub fn launch(cache: &AppCache, data: &Path, app: DesktopApp, port: u16, restart: bool, pac_active: bool, explicit: bool) -> Result<(), String> {
     let mut installations = cache.cached(data)?;
     for retry in [false, true] {
         let active = installations.clone().check_running_clients()?;
         let found = &active.0[app as usize];
-        let target = found.target(pac_active);
+        let target = if explicit {
+            let known = &installations.0[app as usize];
+            let path = known.package_executable.as_ref().or_else(|| known.paths.first())
+                .ok_or("Для безопасного перезапуска нужен обнаруженный исполняемый файл. Обновите список приложений или откройте рабочий браузер.")?;
+            Some(Target::Executable(path.clone()))
+        } else {
+            found.target(pac_active)
+        };
         let missing = match target.as_ref() {
             Some(Target::Executable(path)) => !path.is_file(),
             Some(Target::Appx(_)) => found.package_root.as_ref().is_some_and(|root| !root.is_dir()),
@@ -317,6 +377,16 @@ pub fn launch(cache: &AppCache, data: &Path, app: DesktopApp, port: u16, restart
             return Err("Для этого клиента включите точечный маршрут Store в настройках Workspace.".into());
         }
         if !found.processes.is_empty() {
+            if explicit {
+                if let Target::Executable(path) = &target {
+                    let expected = path.canonicalize().map_err(|_| "Исполняемый файл больше недоступен")?;
+                    if found.processes.iter().any(|running| {
+                        running.image.as_ref().and_then(|path| path.canonicalize().ok()).as_ref() != Some(&expected)
+                    }) {
+                        return Err("Приложение запущено из другого каталога. Закройте его вручную и повторите запуск.".into());
+                    }
+                }
+            }
             if !restart { return Err("Клиент уже запущен. Выберите перезапуск через туннель.".into()); }
             close_for_restart(app, &installations, &found.processes)?;
         }
@@ -342,6 +412,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_direct_and_mixed_processes_without_treating_pac_as_proof() {
+        let managed = "Cursor --proxy-server=http://127.0.0.1:32100 --disable-quic";
+        let mut found = Discovery { processes: vec![Process { id: 1, image: None, command: Some(managed.into()) }], ..Discovery::default() };
+        assert!(!found.status(Some(32100), false, false).unprotected);
+        assert!(found.status(Some(32101), true, false).unprotected);
+        assert!(found.status(None, false, false).unprotected);
+        found.processes.push(Process { id: 2, image: None, command: Some("Cursor".into()) });
+        assert!(found.status(Some(32100), true, false).unprotected);
+        assert!(!found.status(None, false, true).unprotected);
+        assert!(found.status(None, false, true).running);
+        assert!(!uses_workspace_proxy(Some("Cursor --proxy-server=http://127.0.0.1:32100"), Some(32100)));
+    }
+
+    #[test]
     fn preserves_and_validates_cached_installations_without_serializing_processes() {
         let data = std::env::temp_dir().join(format!("workspace-installations-{}", std::process::id()));
         std::fs::create_dir_all(&data).unwrap();
@@ -350,8 +434,9 @@ mod tests {
         let package = data.join("Codex");
         std::fs::create_dir_all(&package).unwrap();
         let cached = Installations([
-            Discovery { paths: vec![executable.clone()], processes: vec![Process { id: 42, command: Some("unpersisted".into()) }], ..Discovery::default() },
+            Discovery { paths: vec![executable.clone()], processes: vec![Process { id: 42, image: None, command: Some("unpersisted".into()) }], ..Discovery::default() },
             Discovery { package_root: Some(package.clone()), package: Some("OpenAI.Codex_publisher!App".into()), registered: true, ..Discovery::default() },
+            Discovery::default(),
         ]);
         cached.save(&data).unwrap();
         let cache = AppCache::default();
@@ -375,11 +460,11 @@ mod tests {
             "package":"OpenAI.ChatGPT-Desktop_abc123!ChatGPT","registered":true,
             "paths":["C:/Programs/ChatGPT.exe"],"processes":[{"id":123,"command":null}]
         }"#).unwrap();
-        found.processes.push(Process { id: 123, command: None });
+        found.processes.push(Process { id: 123, image: None, command: None });
         assert!(matches!(found.target(false), Some(Target::Executable(_))));
         assert!(matches!(found.target(true), Some(Target::Appx(_))));
-        assert_eq!(found.status(Some(10081), true).proxy, "pac");
-        assert_eq!(found.status(Some(10081), false).proxy, "unknown");
+        assert_eq!(found.status(Some(10081), true, false).proxy, "pac");
+        assert_eq!(found.status(Some(10081), false, false).proxy, "unknown");
         assert!(valid_aumid("OpenAI.Codex_2p2nqsd0c76g0!App"));
         assert!(!valid_aumid("bad\\path!App"));
     }
@@ -388,9 +473,9 @@ mod tests {
     fn store_launcher_does_not_require_an_executable_path_or_an_existing_proxy() {
         for package in ["OpenAI.Codex_2p2nqsd0c76g0!App", "OpenAI.ChatGPT-Desktop_abc123!ChatGPT", "Claude_abc123!App"] {
             for running in [false, true] {
-                let processes = if running { vec![Process { id: 3, command: None }] } else { vec![] };
+                let processes = if running { vec![Process { id: 3, image: None, command: None }] } else { vec![] };
                 let found = Discovery { package: Some(package.into()), registered: true, processes, ..Discovery::default() };
-                let status = found.status(Some(10081), false);
+                let status = found.status(Some(10081), false, false);
                 assert!(status.installed && status.can_launch && status.store);
                 assert_eq!(status.running, running);
             }
@@ -399,11 +484,11 @@ mod tests {
 
     #[test]
     fn current_proxy_port_is_required_for_running_process() {
-        let found = Discovery { processes: vec![Process { id: 1, command: Some(
+        let found = Discovery { processes: vec![Process { id: 1, image: None, command: Some(
             "Claude.exe --proxy-server=http://127.0.0.1:10081".into()) }], ..Discovery::default() };
-        assert!(found.status(None, false).installed);
-        assert_eq!(found.status(Some(10081), false).proxy, "arguments");
-        assert_eq!(found.status(Some(10082), false).proxy, "unknown");
+        assert!(found.status(None, false, false).installed);
+        assert_eq!(found.status(Some(10081), false, false).proxy, "arguments");
+        assert_eq!(found.status(Some(10082), false, false).proxy, "unknown");
     }
 
     #[test]
@@ -413,6 +498,8 @@ mod tests {
         let Some(Target::Executable(exe)) = found.target(false) else { panic!("expected executable") };
         let command = desktop_command(&exe, 10081);
         assert_eq!(command.get_args().next().unwrap(), "--proxy-server=http://127.0.0.1:10081");
+        assert!(command.get_args().any(|arg| arg == "--disable-quic"));
+        assert!(command.get_envs().any(|(name, value)| name == "NO_PROXY" && value.is_none()));
         assert!(command.get_envs().any(|(name, value)| name == "HTTPS_PROXY" && value == Some(std::ffi::OsStr::new("http://127.0.0.1:10081"))));
     }
 

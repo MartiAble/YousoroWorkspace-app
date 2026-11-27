@@ -340,7 +340,7 @@ pub struct Report {
     probes: NetworkProbes,
     pub network: Option<Observation>,
     network_error: Option<String>,
-    matched: Option<bool>,
+    pub matched: Option<bool>,
     dns: Option<dns_radar::DnsReport>,
     devices: Option<DeviceSlots>,
     browser: Browser,

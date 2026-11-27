@@ -8,7 +8,7 @@ import {scheduleInitialUpdate} from './startup-update.mjs';
 const FOUR_HOURS = 4 * 60 * 60 * 1000;
 const AUTO_CHECK = 'workspace.autoUpdate';
 
-export function useAppUpdates(native: boolean, ready: boolean) {
+export function useAppUpdates(native: boolean) {
   const [version,setVersion] = useState('');
   const [available,setAvailable] = useState<Update|null>(null);
   const [phase,setPhase] = useState<'idle'|'checking'|'downloading'|'installing'>('idle');
@@ -58,11 +58,11 @@ export function useAppUpdates(native: boolean, ready: boolean) {
     return () => { void current.current?.close().catch(() => {}); };
   }, [native]);
   useEffect(() => {
-    if (!native || !ready || !automatic) return;
+    if (!native || !automatic) return;
     const stop = scheduleInitialUpdate(refresh, window);
     const periodic = window.setInterval(() => void refresh(), FOUR_HOURS);
     return () => { stop(); window.clearInterval(periodic); };
-  }, [native, ready, automatic, refresh]);
+  }, [native, automatic, refresh]);
 
   function autoCheck(enabled: boolean) {
     try { localStorage.setItem(AUTO_CHECK, enabled ? 'on' : 'off'); } catch {}

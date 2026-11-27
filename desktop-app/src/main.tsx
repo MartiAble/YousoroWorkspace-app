@@ -101,8 +101,8 @@ function App() {
   const [contrast,setContrast] = useState(() => localStorage.getItem('workspace.contrast') === 'on');
   const [shellIndex,setShellIndex] = useState(0);
   const [copied,setCopied] = useState('');
-  const [loading,setLoading] = useState(native);
-  const updates = useAppUpdates(native, !loading);
+  const [activation,setActivation] = useState<"checking"|"required"|"offline"|"restored">(native ? "checking" : "required");
+  const updates = useAppUpdates(native);
   const busy = working || updates.phase === 'downloading' || updates.phase === 'installing';
   const [message,setMessage] = useState('');
   const [installed,setInstalled] = useState<InstalledApps|null>(null);
@@ -180,36 +180,47 @@ function App() {
   }, []);
   useEffect(() => { if (native) void refreshClients().catch(() => {}); }, [connection.port,connection.system_proxy]);
   const refreshLock = useRef(false);
+  const sessionRevision = useRef(0);
   async function refreshAccount(showError = false) {
     if (refreshLock.current) return;
     refreshLock.current = true;
+    const revision = sessionRevision.current;
     try {
       const updated = await invoke<Account>('account');
+      if (revision !== sessionRevision.current) return;
       setAccount(updated);
-      if (showError) setError('');
+      setActivation("restored");
+      if (showError || activation === "offline") setError('');
     } catch (error) {
+      if (revision !== sessionRevision.current) return;
       const message = String(error);
       if (message === 'DEVICE_REVOKED') {
         setAccount(null);
         setConnection(empty);
+        setActivation("required");
         setError(message);
-      } else if (message !== 'ACTIVATION_REQUIRED' && showError) {
-        setError(message);
+      } else if (message === "ACTIVATION_REQUIRED") {
+        setAccount(null);
+        setConnection(empty);
+        setActivation("required");
+      } else {
+        setActivation("offline");
+        if (showError) setError(message);
       }
     } finally { refreshLock.current = false; }
   }
   useEffect(() => {
     if (!native) return;
-    void refreshAccount(true).finally(() => setLoading(false));
+    void refreshAccount(true);
     invoke<Region[]>('regions').then(setRegions).catch(() => {});
   }, []);
   useEffect(() => {
-    if (!native || !account) return;
+    if (!native || (!account && activation !== "offline")) return;
     const check = () => { if (!workLock.current && !connecting.current) void refreshAccount(); };
-    const id = window.setInterval(check, account.profile.state === 'pending' ? 3000 : 15000);
+    const id = window.setInterval(check, account?.profile.state === 'pending' ? 3000 : 15000);
     window.addEventListener('focus', check);
     return () => { window.clearInterval(id); window.removeEventListener('focus', check); };
-  }, [account?.email, account?.profile.state]);
+  }, [activation, account?.email, account?.profile.state]);
   useEffect(() => {
     if (!native || !account) return;
     let active = true;
@@ -483,7 +494,8 @@ function App() {
     ? <SubscriptionBanner notice={subscription} renew={()=>void official("renewal")}
         dismiss={urgency === "expired" ? undefined : ()=>setHiddenSubscription(subscriptionKey)}/> : null;
   const signOut = () => perform(async () => {
-    await invoke('sign_out'); setLaunchWarning(null); setConnection(empty); setAccount(null); setCode(''); setHiddenSubscription('');
+    sessionRevision.current++;
+    await invoke('sign_out'); setLaunchWarning(null); setConnection(empty); setAccount(null); setActivation('required'); setCode(''); setHiddenSubscription('');
   });
   const dedicatedCard = account && passState && (held ? passState.held_pass : passState.active_pass) &&
     <DedicatedPass passes={passState} price={account.dedicated_pass_price_rub}
@@ -511,10 +523,15 @@ function App() {
     : account?.profile.state === 'pending' ? ['Закрепляем регион', 'Лаунчер откроет рабочее место, как только регион будет готов.']
     : ['Выберите регион', 'Закрепите регион рабочего канала в кабинете.'];
   return !account ? <main className="sign-screen"><section className="sign-card panel">
-    <Brand/><h1>Активируйте компьютер</h1><p>Код активации находится в кабинете → раздел «Компьютер».</p>
+    <Brand/><h1>{activation === "required" ? "Активируйте компьютер" : activation === "offline" ? "Не удалось проверить аккаунт" : "Проверяем аккаунт"}</h1>
     {!native && <p role="status">Веб-предпросмотр. Для входа откройте приложение Tauri.</p>}
-    {!loading && <UpdateBanner updates={updates} busy={busy}/>}
-    {loading ? <p role="status">Проверяем активацию компьютера…</p> : <form onSubmit={e=>{e.preventDefault();void perform(async()=>{
+    <UpdateBanner updates={updates} busy={busy}/>
+    {activation === "checking" ? <p role="status">Проверяем активацию компьютера…</p> : activation === "offline" ? <>
+      <p role="status">Проверка повторится автоматически. Сохранённый ключ можно использовать при восстановлении связи.</p>
+      {error && <p className="error" role="alert">{error}</p>}
+      <div className="gate-actions"><button className="primary" disabled={busy} onClick={()=>void perform(()=>refreshAccount(true))}>Проверить снова</button>
+      <button className="quiet" disabled={busy} onClick={()=>void signOut()}>Выйти</button></div>
+    </> : <form onSubmit={e=>{e.preventDefault();void perform(async()=>{
       setAccount(await invoke<Account>('activate',{code})); setCode('');
     });}}>
       <label>Код активации<input name="code" value={code} onChange={e=>{setCode(formatActivationCode(e.target.value)); if (error) setError('');}}

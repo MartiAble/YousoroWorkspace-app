@@ -158,7 +158,14 @@ async fn tunnel_status(app: AppHandle) -> Result<Status, String> { blocking(move
 async fn activate(code: String) -> Result<service::Account,String> { blocking(move || service::activate(code)).await }
 #[tauri::command]
 async fn account(app: AppHandle) -> Result<service::Account,String> { blocking(move || {
-    let result = service::Session::restore().and_then(|session| service::account(&session));
+    let result = service::Session::restore().and_then(|session| {
+        let result = service::account(&session);
+        if result.as_ref().is_err_and(|error| error == "DEVICE_REVOKED") {
+            // Preserve the server verdict even if the OS refuses to remove the local key.
+            let _ = session.forget_revoked();
+        }
+        result
+    });
     let state = app.state::<Runtime>();
     let connected = status(&app);
     let invalidate = match &result {
@@ -521,13 +528,25 @@ async fn run_system_radar(app: AppHandle, check_dns: Option<bool>) -> Result<rad
         let report = radar::report(port, region, &data, &state.browser_probe, check_dns.unwrap_or(false), device_id.as_deref(), environment.as_ref(), pac_active, apps,
             |stage| { let _ = app.emit("radar-progress", stage); });
         if status(&app).port != Some(port) { return Err("Туннель изменился во время диагностики".into()); }
-        if let (Some(ip), Ok(session)) = (report.network.as_ref().map(|value| value.ip), service::Session::restore()) {
-            if service::desktop_ping(&session, ip).is_err() {
+        let ip = report.network.as_ref().map(|value| value.ip);
+        let passed = report.matched.or_else(|| ip.is_none().then_some(false));
+        if let (Some(passed), Ok(session)) = (passed, service::Session::restore()) {
+            if service::desktop_ping(&session, ip, passed).is_err() {
                 let _ = app.emit("radar-device-ping-failed", ());
             }
         }
         Ok(report)
     }).await
+}
+
+fn browser_parity(result: &Value, expected: Option<std::net::Ipv4Addr>) -> Option<(Option<std::net::Ipv4Addr>, bool)> {
+    let ip = result["observed_ip"].as_str().and_then(|value| value.parse().ok());
+    if result["ipv6"] == "reachable" || result["ice"] == "mismatch" || result["local_ip"] == "exposed"
+        || result["dns"] == "system_overlap"
+    {
+        return Some((ip, false));
+    }
+    ip.zip(expected).map(|(ip, expected)| (Some(ip), ip == expected))
 }
 
 fn pull_browser_report(
@@ -592,6 +611,7 @@ async fn run_browser_probe(app: AppHandle, stun: bool, check_dns: Option<bool>, 
         let environment = dedicated_browser_environment(&session, environment, browser_running || ignore_timezone)?;
         let override_zone = browser_timezone_override(local_timezone.as_deref(), environment.as_ref())
             .filter(|_| !ignore_timezone);
+        let expected_ipv4 = exit_ip.as_deref().and_then(|ip| ip.parse().ok());
         let client = service::client()?;
         #[derive(serde::Deserialize)]
         struct Started { token: String, diagnostics_origin: String, ipv6_origin: Option<String>, region: Option<String> }
@@ -641,6 +661,13 @@ async fn run_browser_probe(app: AppHandle, stun: bool, check_dns: Option<bool>, 
                 let dns_result = browser_dns.as_ref().map_or("unmeasured", dns_radar::BrowserDns::finish);
                 result["dns"] = json!(dns_result);
                 result["ipv6_probe_available"] = json!(ipv6_probe_available);
+                let mut parity = browser_parity(&result, expected_ipv4);
+                if let Some((ip, passed)) = parity {
+                    if service::desktop_ping(&session, ip, passed).is_err() {
+                        let _ = app.emit("radar-device-ping-failed", ());
+                        parity = None;
+                    }
+                }
                 if let Some(mut revision) = body["revision"].as_u64() {
                     let watched_app = app.clone();
                     std::thread::spawn(move || {
@@ -658,6 +685,14 @@ async fn run_browser_probe(app: AppHandle, stun: bool, check_dns: Option<bool>, 
                                     let mut report = body["report"].clone();
                                     report["dns"] = json!(dns_result);
                                     report["ipv6_probe_available"] = json!(ipv6_probe_available);
+                                    let next_parity = browser_parity(&report, expected_ipv4);
+                                    if let Some((ip, passed)) = next_parity.filter(|next| Some(*next) != parity) {
+                                        if service::desktop_ping(&session, ip, passed).is_err() {
+                                            let _ = watched_app.emit("radar-device-ping-failed", ());
+                                        } else {
+                                            parity = next_parity;
+                                        }
+                                    }
                                     let _ = watched_app.emit("browser-probe-update", report);
                                 }
                             }

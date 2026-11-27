@@ -17,7 +17,7 @@ export type RadarSummary = {
   } | null;
   environment?: { timezone: string; locale: string } | null;
   location: {city: string | null; country_code: string | null; timezone: string | null};
-  device_parity: {status: 'matched' | 'mismatch' | 'single_device'; hint: string};
+  device_parity: {status: 'matched' | 'mismatch' | 'single_device' | 'unchecked' | 'failed'; hint: string};
 };
 
 const number = new Intl.NumberFormat('ru', {maximumFractionDigits: 0});

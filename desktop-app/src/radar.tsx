@@ -160,8 +160,13 @@ export function radarModel(props: Props) {
   const rtcLeak = differentWebRtcAddress || localExposed;
   const rtcOk = measured?.ice === 'match' && localProtected;
   const rtcOff = browser?.webrtc_protected === false;
+  const rtcConfigured = !rtcLeak && !rtcOff && !rtcOk && (browser?.webrtc_protected === true ||
+    connected && browser?.running !== true);
+  const parityTone: Tone = parity?.status === "matched" ? "ok" :
+    parity?.status === "mismatch" || parity?.status === "failed" ? "error" :
+    parity?.status === "single_device" ? "warning" : "idle";
   const environmentMismatch = browserMismatch || localeMismatch || measured?.timezone_matches === false || browser?.actual?.timezone_matches === false && !measured;
-  const runScan = 'Нажмите «Проверить всё» при активном контуре.';
+  const runScan = connected ? 'Нажмите «Проверить снова».' : 'Нажмите «Запустить контур».';
   const runBrowser = 'Нажмите «Проверить в браузере».';
   // Keep the IPC order of support_diagnostics::SIGNALS independent of display order.
   const readiness: Row[] = [
@@ -186,22 +191,22 @@ export function radarModel(props: Props) {
         : quicOk ? 'Прокси отклонил UDP · QUIC выключен в браузере'
         : udp === 'blocked' ? 'Прокси отклонил UDP · QUIC в браузере не проверен' : 'Блокировка ещё не подтверждена',
       hint:quicProblem ? 'Переподключите контур, заново откройте рабочий браузер и повторите проверку.'
-        : 'Откройте рабочий браузер из лаунчера и нажмите «Проверить всё».' },
+        : 'Откройте рабочий браузер из лаунчера и нажмите «Проверить в браузере».' },
     { title:'Часовой пояс и локаль', tone:environmentMismatch ? 'error' : environmentOk ? 'ok' : 'idle',
       text:environmentMismatch ? 'Часовой пояс или язык отличаются от настроек канала'
         : environmentOk ? [expectedTimezone, desiredLanguage, 'синхронизировано'].filter(Boolean).join(' · ')
         : browser?.running === false && !measured ? 'Рабочий браузер закрыт' : 'Часовой пояс и язык браузера не проверены',
       hint:environmentMismatch ? 'Заново откройте рабочий браузер из лаунчера и повторите проверку.' : runBrowser,
       action:browserMismatch ? timeAction : undefined },
-    { title:'Политика WebRTC', tone:rtcLeak || rtcOff ? 'error' : rtcOk ? 'ok' : 'idle', leak:rtcLeak,
+    { title:'Политика WebRTC', tone:rtcLeak || rtcOff ? 'error' : rtcOk || rtcConfigured ? 'ok' : 'idle', leak:rtcLeak, configured:rtcConfigured,
       text:rtcLeak ? 'Обнаружен локальный или другой публичный адрес'
         : rtcOff ? 'Ограничение видеосвязи в профиле выключено' : rtcOk ? 'Адрес видеосвязи совпал с рабочим выходом'
-        : browser?.webrtc_protected ? 'Ограничение включено · внешняя проба не подтверждена' : 'Защита видеосвязи не проверена',
+        : rtcConfigured ? 'Рабочий Chromium запускается с ограничением прямого UDP. Сверьте адрес кнопкой «Проверить в браузере».' : 'Откройте рабочий Chromium из лаунчера для проверки.',
       hint:rtcLeak || rtcOff ? 'Закройте рабочие вкладки, восстановите профиль и повторите проверку.'
         : 'Нажмите «Проверить в браузере», чтобы сверить адрес видеосвязи.',
       action:(rtcLeak || rtcOff) && browser?.running === false ? {label:'Восстановить защиту',run:props.repair} : undefined },
-    { title:'Сверка ПК и смартфона', tone:parity?.status === 'matched' ? 'ok' : parity?.status === 'mismatch' ? 'warning' : 'idle',
-      text:parity?.status === 'matched' ? 'Выходные адреса устройств совпадают' : parity?.status === 'mismatch' ? 'Выходные адреса устройств различаются' : 'Не сверялось со смартфоном',
+    { title:'Сверка ПК и смартфона', tone:parityTone,
+      text:parity?.hint ?? 'Запустите проверку на компьютере и смартфоне.',
       hint:'Откройте раздел «Смартфон» в кабинете с телефона при включённом Hiddify и повторите проверку.',
       action:parity?.status !== 'matched' ? {label:'Раздел «Смартфон»',run:props.openPhone} : undefined },
   ];
@@ -230,7 +235,7 @@ export function radarModel(props: Props) {
     },
     {
       title:'ПК и смартфон',
-      tone: parity?.status === 'matched' ? 'ok' : parity?.status === 'mismatch' ? 'error' : 'idle',
+      tone: parityTone,
       text: parity?.hint ?? 'Запустите проверку на обоих устройствах.',
     },
     {
@@ -352,7 +357,7 @@ export function Radar({model, ...props}: Props & {model: ReturnType<typeof radar
         </div>
       </div>
       <div className="radar-controls">
-        <button className={prioritizeBrowser ? undefined : "primary"} disabled={busy || props.scanPaused} onClick={connected ? props.scan : props.connect}>{stage && stage !== 'complete' ? 'Проверяем…' : connected ? report || props.browserReport ? 'Проверить снова' : 'Проверить всё' : props.scanPaused ? 'Контур на паузе' : 'Запустить контур'}</button>
+        <button className={prioritizeBrowser ? undefined : "primary"} disabled={busy || props.scanPaused} onClick={connected ? props.scan : props.connect}>{stage && stage !== 'complete' ? 'Проверяем…' : connected ? 'Проверить снова' : props.scanPaused ? 'Контур на паузе' : 'Запустить контур'}</button>
         <button className={prioritizeBrowser ? "primary" : undefined} disabled={!connected || busy} onClick={props.scanBrowser}>Проверить в браузере</button>
       </div>
       {phase && <div className="radar-progress" role="status">

@@ -161,9 +161,9 @@ pub fn radar_summary(s: &Session) -> Result<RadarSummary, String> {
         .json().map_err(|_| "Не удалось прочитать сводку Радара".into())
 }
 
-pub fn desktop_ping(s: &Session, ip: std::net::Ipv4Addr) -> Result<(), String> {
+pub fn desktop_ping(s: &Session, ip: Option<std::net::Ipv4Addr>, passed: bool) -> Result<(), String> {
     checked(s.authorize(client()?.post(format!("{ORIGIN}/api/radar/device-ping")))
-        .json(&json!({ "device_type": "desktop", "observed_ip": ip })).send())?;
+        .json(&json!({ "device_type": "desktop", "observed_ip": ip, "passed": passed })).send())?;
     Ok(())
 }
 
@@ -176,12 +176,20 @@ pub fn checked(result: Result<Response, reqwest::Error>) -> Result<Response, Str
     if r.status().is_success() { return Ok(r); }
     let status = r.status().as_u16();
     let payload = r.json::<Value>().unwrap_or_default();
+    Err(response_error(status, &payload))
+}
+
+fn response_error(status: u16, payload: &Value) -> String {
     let detail = &payload["detail"];
-    if let Some(code @ ("DEVICE_REVOKED" | "INVALID_ACTIVATION_CODE" | "DEVICE_LIMIT_REACHED")) = detail["code"].as_str() {
-        return Err(code.into());
+    if status == 401 && detail["code"] == "DEVICE_REVOKED" && detail["revoked"] == true {
+        return "DEVICE_REVOKED".into();
     }
-    Err(detail["message"].as_str().or_else(|| detail.as_str()).map(str::to_owned)
-        .unwrap_or_else(|| format!("Сервис Workspace ответил HTTP {status}")))
+    if let Some(code @ ("INVALID_ACTIVATION_CODE" | "DEVICE_LIMIT_REACHED")) = detail["code"].as_str() {
+        return code.into();
+    }
+    detail["message"].as_str().or_else(|| detail.as_str())
+        .filter(|message| !matches!(*message, "DEVICE_REVOKED" | "ACTIVATION_REQUIRED"))
+        .map(str::to_owned).unwrap_or_else(|| format!("Сервис Workspace ответил HTTP {status}"))
 }
 pub fn key(name: &str) -> Result<Entry, String> {
     Entry::new(KEYCHAIN, name).map_err(|_| "Системное хранилище недоступно".into())
@@ -192,8 +200,20 @@ impl Session {
             keyring::Error::NoEntry => "ACTIVATION_REQUIRED".to_owned(),
             _ => "Не удалось прочитать ключ устройства".to_owned(),
         })?;
-        if !is_token(&token) { return Err("ACTIVATION_REQUIRED".into()); }
+        if !is_token(&token) { return Err("Не удалось прочитать ключ устройства".into()); }
         Ok(Self { token })
+    }
+
+    pub fn forget_revoked(&self) -> Result<(), String> {
+        let entry = key("activation-device")?;
+        match entry.get_password() {
+            Ok(token) if token == self.token => match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(_) => Err("Системное хранилище не удалило отозванный ключ".into()),
+            },
+            Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Не удалось прочитать ключ устройства".into()),
+        }
     }
 
     pub fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
@@ -276,6 +296,15 @@ pub fn bootstrap(session: &Session) -> Result<Bootstrap, String> {
 #[cfg(test)]
 mod radar_contract_tests {
     use super::*;
+
+    #[test]
+    fn only_confirmed_server_revocation_returns_the_revocation_signal() {
+        let confirmed = json!({ "detail": { "code": "DEVICE_REVOKED", "revoked": true } });
+        assert_eq!(response_error(401, &confirmed), "DEVICE_REVOKED");
+        assert_ne!(response_error(503, &confirmed), "DEVICE_REVOKED");
+        assert_ne!(response_error(401, &json!({"detail":{"code":"DEVICE_REVOKED"}})), "DEVICE_REVOKED");
+        assert_ne!(response_error(503, &json!({"detail":"DEVICE_REVOKED"})), "DEVICE_REVOKED");
+    }
 
     #[test]
     fn route_requires_license_live_subscription_and_applied_region() {
